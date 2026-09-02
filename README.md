@@ -30,6 +30,30 @@ set +a
 python3 main.py
 ```
 
+也可以启动 HTTP API，供网页、桌面客户端或定时任务使用：
+
+```bash
+uvicorn api:app --host 127.0.0.1 --port 8000 --reload
+```
+
+启动后可打开 `http://127.0.0.1:8000/docs` 调试。API 默认只监听本机：
+
+- `GET /health`：健康状态与当前日记日期。
+- `GET /v1/session`：读取今天的完整对话。
+- `POST /v1/chat`：发送一条消息，body 为 `{"message": "今天……"}`。
+- `POST /v1/preview`：生成 Markdown 预览，不写文件。
+- `POST /v1/finalize`：生成并写入今天的 Obsidian 日记。
+
+示例：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"今天终于完成了拖了很久的事情"}'
+
+curl -X POST http://127.0.0.1:8000/v1/finalize
+```
+
 聊天记录保存在 `data/diary.sqlite`。每天按配置时区自动建立一个会话；中途退出不会
 丢失。输入 `/done` 后，程序会生成 `YYYY-MM-DD.md` 并原子写入指定的 Obsidian
 目录；当天再次执行 `/done` 会更新同一篇日记。输入 `/preview` 可先看结果。
