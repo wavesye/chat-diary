@@ -5,10 +5,8 @@
 ## 为什么采用轻量工作流
 
 这个需求的路径是确定的：聊天 → 结束确认 → 结构化提取 → Markdown → Obsidian。
-它不需要 BMS Agent 那种动态工具循环，也暂时不需要 Writing Agent 的 RAG。
-因此本项目复用了两个项目里验证过的思路（Provider 配置、本地 SQLite 记忆），但不引入
-LangGraph 和 MCP。等以后加入照片搜索、日历、健康数据等多个动态工具时，再引入
-OpenAI Agents SDK 或 LangGraph 会更划算。
+它不需要用到LangGraph那种动态工具循环，暂时不引入LangGraph和MCP，等以后加入照片搜索、日历、健康数据等多个动态工具时，再引入
+OpenAI Agents SDK 或 LangGraph 。
 
 ## 运行
 
