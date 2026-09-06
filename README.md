@@ -89,3 +89,28 @@ python3 -m unittest discover -s tests -v
 ```
 
 测试不访问模型 API，也不会写入真实 Obsidian vault。
+
+## Telegram Bot
+
+此模式使用 Telegram 官方 Bot API 的长轮询，不需要公网域名。先在 Telegram 中联系
+`@BotFather`，使用 `/newbot` 创建 Bot，把 Token 写入 `.env`：
+
+```env
+TELEGRAM_BOT_TOKEN="123456789:..."
+TELEGRAM_ALLOWED_USER_ID=""
+```
+
+加载 `.env` 并启动：
+
+```bash
+set -a
+source .env
+set +a
+python3 telegram_bot.py
+```
+
+第一次保持 `TELEGRAM_ALLOWED_USER_ID` 为空，给 Bot 发送 `/start`，它会返回你的数字
+user ID。把该数字填回 `.env` 并重启 Bot。配对后只有这个用户可以触发日记和记忆逻辑。
+
+支持普通聊天以及 `/preview`、`/done`、`/memory`、`/help`。更新游标保存在 SQLite，
+重启后不会从头消费已经处理过的 Telegram 消息。Bot 和 Web UI 使用同一天的本地会话。

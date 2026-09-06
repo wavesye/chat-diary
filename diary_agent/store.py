@@ -27,6 +27,10 @@ class DiaryStore:
                 markdown_path TEXT NOT NULL,
                 finalized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
 
@@ -76,3 +80,18 @@ class DiaryStore:
                     "finalized_at=CURRENT_TIMESTAMP",
                     (day, str(path)),
                 )
+
+    def get_state(self, key: str, default: str = "") -> str:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT value FROM app_state WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else default
+
+    def set_state(self, key: str, value: str) -> None:
+        with self._lock, self.connection:
+            self.connection.execute(
+                "INSERT INTO app_state(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
