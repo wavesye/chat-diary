@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>拾光 · 对话日记</title>
+  <link rel="stylesheet" href="/assets/styles.css?v=20260906-2">
+  <link rel="stylesheet" href="/assets/overrides.css?v=20260906-2">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="today-card">
+        <span id="monthDay">今天</span>
+        <strong id="weekday">星期</strong>
+        <small id="fullDate">加载中</small>
+      </div>
+      <nav>
+        <button class="nav-item active"><span>◌</span><div><strong>今天的对话</strong><small id="messageCount">还没有开始</small></div></button>
+      </nav>
+      <div class="sidebar-spacer"></div>
+      <div class="privacy"><i></i><span>聊天和日记保存在你的电脑</span></div>
+    </aside>
+
+    <main class="main">
+      <header>
+        <button class="mobile-menu" id="mobileMenu" aria-label="打开菜单">☰</button>
+        <button class="ghost" id="themeButton" aria-label="切换明暗主题">☼</button>
+      </header>
+
+      <section class="chat" id="chat">
+        <div class="welcome" id="welcome">
+          <div class="sun">✦</div>
+          <p id="greeting">今天最想从哪一刻说起？</p>
+          <div class="starters">
+            <button data-text="今天最让我开心的一件事是……">一件开心的小事</button>
+            <button data-text="今天有件事一直压在我心里……">一件放不下的事</button>
+            <button data-text="今天看起来很普通，不过……">平常的一天</button>
+          </div>
+        </div>
+        <div class="messages" id="messages"></div>
+      </section>
+
+      <footer class="composer-area">
+        <div class="composer">
+          <textarea id="messageInput" rows="1" placeholder="慢慢说，我在听……" aria-label="聊天内容"></textarea>
+          <div class="composer-bottom">
+            <span>Enter 发送 · Shift+Enter 换行</span>
+            <button class="send" id="sendButton" aria-label="发送">↑</button>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="secondary" id="previewButton">预览今日手记</button>
+          <button class="primary" id="finishButton"><span>✓</span> 写入 Obsidian</button>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <div class="overlay" id="overlay"></div>
+  <aside class="preview" id="preview" aria-hidden="true">
+    <header><div><span class="eyebrow">TODAY'S NOTE</span><h2>今日手记</h2></div><button id="closePreview" aria-label="关闭">×</button></header>
+    <div class="paper" id="paper"><p class="paper-empty">聊过几句后，这里会出现一篇连贯的日记。</p></div>
+    <button class="primary wide" id="saveFromPreview">写入 Obsidian</button>
+  </aside>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/assets/app.js?v=20260906-3"></script>
+</body>
+</html>

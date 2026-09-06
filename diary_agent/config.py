@@ -17,6 +17,10 @@ class Settings:
     base_url: str
     api_key: str
     user_name: str
+    embedding_base_url: str = ""
+    embedding_api_key: str = ""
+    embedding_model: str = ""
+    memory_top_k: int = 5
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -51,5 +55,8 @@ class Settings:
             base_url=base_url,
             api_key=api_key or "ollama",
             user_name=os.getenv("DIARY_USER_NAME", "你"),
+            embedding_base_url=os.getenv("EMBEDDING_BASE_URL", "").rstrip("/"),
+            embedding_api_key=os.getenv("EMBEDDING_API_KEY", ""),
+            embedding_model=os.getenv("EMBEDDING_MODEL", ""),
+            memory_top_k=max(1, min(int(os.getenv("MEMORY_TOP_K", "5")), 10)),
         )
-

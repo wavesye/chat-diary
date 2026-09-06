@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from diary_agent.config import Settings
@@ -19,9 +22,17 @@ class ChatResponse(BaseModel):
     reply: str
 
 
+class MessageItem(BaseModel):
+    id: int
+    role: str
+    content: str
+    created_at: str
+
+
 class SessionResponse(BaseModel):
     day: str
-    messages: list[dict[str, str]]
+    greeting: str
+    messages: list[MessageItem]
 
 
 class PreviewResponse(BaseModel):
@@ -32,6 +43,11 @@ class PreviewResponse(BaseModel):
 class FinalizeResponse(BaseModel):
     day: str
     path: str
+
+
+class MemoryResponse(BaseModel):
+    mode: str
+    memories: list[dict]
 
 
 def create_app(service: DiaryService | None = None) -> FastAPI:
@@ -59,7 +75,11 @@ def create_app(service: DiaryService | None = None) -> FastAPI:
 
     @app.get("/v1/session", response_model=SessionResponse)
     def get_session(diary: DiaryService = Depends(get_service)) -> SessionResponse:
-        return SessionResponse(day=diary.day, messages=diary.store.messages(diary.day))
+        return SessionResponse(
+            day=diary.day,
+            greeting=diary.greeting(),
+            messages=diary.store.message_records(diary.day),
+        )
 
     @app.post("/v1/chat", response_model=ChatResponse)
     def chat(
@@ -70,6 +90,14 @@ def create_app(service: DiaryService | None = None) -> FastAPI:
         except Exception as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         return ChatResponse(day=diary.day, reply=answer)
+
+    @app.delete("/v1/messages/{message_id}")
+    def delete_message(
+        message_id: int, diary: DiaryService = Depends(get_service)
+    ) -> dict[str, bool]:
+        if not diary.delete_message(message_id):
+            raise HTTPException(status_code=404, detail="Message not found for today")
+        return {"ok": True, "memories_need_rebuild": True}
 
     @app.post("/v1/preview", response_model=PreviewResponse)
     def preview(diary: DiaryService = Depends(get_service)) -> PreviewResponse:
@@ -90,6 +118,25 @@ def create_app(service: DiaryService | None = None) -> FastAPI:
         except Exception as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         return FinalizeResponse(day=diary.day, path=str(path))
+
+    @app.get("/v1/memories", response_model=MemoryResponse)
+    def memories(diary: DiaryService = Depends(get_service)) -> MemoryResponse:
+        return MemoryResponse(mode=diary.memory.mode, memories=diary.memory.list())
+
+    @app.delete("/v1/memories/{memory_id}")
+    def delete_memory(
+        memory_id: int, diary: DiaryService = Depends(get_service)
+    ) -> dict[str, bool]:
+        if not diary.memory.delete(memory_id):
+            raise HTTPException(status_code=404, detail="Memory not found")
+        return {"ok": True}
+
+    web_dir = Path(__file__).with_name("web")
+    app.mount("/assets", StaticFiles(directory=web_dir), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    def web_ui() -> FileResponse:
+        return FileResponse(web_dir / "index.html")
 
     return app
 

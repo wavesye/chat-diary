@@ -45,6 +45,21 @@ class DiaryStore:
             ).fetchall()
         return [{"role": row["role"], "content": row["content"]} for row in rows]
 
+    def message_records(self, day: str) -> list[dict]:
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT id, role, content, created_at FROM messages "
+                "WHERE day = ? ORDER BY id", (day,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_message(self, day: str, message_id: int) -> bool:
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM messages WHERE day = ? AND id = ?", (day, message_id)
+            )
+        return bool(cursor.rowcount)
+
     def user_message_count(self, day: str) -> int:
         with self._lock:
             row = self.connection.execute(
