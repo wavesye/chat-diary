@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from diary_agent.config import Settings
 from diary_agent.service import DiaryService
 from diary_agent.store import DiaryStore
@@ -66,6 +68,16 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("# 雨里的好消息", self.api.sent[-1][1])
         await bot.handle_update(update(12345, "/done", 3))
         self.assertIn("AIGEN.md", self.api.sent[-1][1])
+
+    def test_only_temporary_telegram_errors_are_retried(self):
+        request = httpx.Request("POST", "https://api.telegram.org/bot/test/getUpdates")
+        self.assertTrue(TelegramDiaryBot._is_retryable(httpx.ReadTimeout("offline", request=request)))
+        self.assertTrue(TelegramDiaryBot._is_retryable(httpx.HTTPStatusError(
+            "server error", request=request, response=httpx.Response(502, request=request)
+        )))
+        self.assertFalse(TelegramDiaryBot._is_retryable(httpx.HTTPStatusError(
+            "unauthorized", request=request, response=httpx.Response(401, request=request)
+        )))
 
 
 if __name__ == "__main__":

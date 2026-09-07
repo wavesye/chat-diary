@@ -53,6 +53,15 @@ class TelegramDiaryBot:
         self.state_key = "telegram_update_offset"
         self.offset = 0
 
+    @staticmethod
+    def _is_retryable(error: Exception) -> bool:
+        """Only retry temporary network/server failures."""
+        if isinstance(error, httpx.RequestError):
+            return True
+        if isinstance(error, httpx.HTTPStatusError):
+            return error.response.status_code == 429 or error.response.status_code >= 500
+        return False
+
     async def handle_update(self, update: dict) -> None:
         message = update.get("message")
         if not message or not isinstance(message.get("text"), str):
@@ -120,11 +129,27 @@ class TelegramDiaryBot:
         print(f"Telegram Bot @{me.get('username', '')} 已启动")
         if self.allowed_user_id is None:
             print("当前为配对模式：给 Bot 发送 /start 获取你的 user ID")
+        retry_delay = 5
         while True:
-            updates = await self.api.call(
-                "getUpdates", offset=self.offset, timeout=30,
-                allowed_updates=["message"],
-            )
+            try:
+                updates = await self.api.call(
+                    "getUpdates", offset=self.offset, timeout=30,
+                    allowed_updates=["message"],
+                )
+                if retry_delay > 5:
+                    print("Telegram 连接已恢复")
+                retry_delay = 5
+            except Exception as error:
+                if not self._is_retryable(error):
+                    raise
+                print(
+                    f"Telegram 连接中断：{error}；{retry_delay} 秒后重试",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)
+                continue
             for update in updates:
                 await self.handle_update(update)
                 self.offset = int(update["update_id"]) + 1
