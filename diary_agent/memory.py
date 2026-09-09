@@ -18,6 +18,10 @@ class MemoryHit:
     first_seen: str
     last_seen: str
     score: float
+    temporal_status: str = "current"
+    confidence: float = 1.0
+    source_file: str | None = None
+    source_date: str | None = None
 
 
 class EmbeddingProvider:
@@ -78,8 +82,28 @@ class LongTermMemory:
                     PRIMARY KEY(memory_id, day),
                     FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS historical_memory_evidence (
+                    memory_id INTEGER NOT NULL,
+                    document_id INTEGER NOT NULL,
+                    source_file TEXT NOT NULL,
+                    source_date TEXT NOT NULL,
+                    time_start TEXT,
+                    time_end TEXT,
+                    confidence REAL NOT NULL,
+                    temporal_status TEXT NOT NULL,
+                    snippet TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(memory_id, document_id, snippet),
+                    FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+                );
                 """
             )
+        self.store._ensure_column("memories", "temporal_status", "TEXT NOT NULL DEFAULT 'current'")
+        self.store._ensure_column("memories", "confidence", "REAL NOT NULL DEFAULT 1.0")
+        self.store._ensure_column("memories", "source_file", "TEXT")
+        self.store._ensure_column("memories", "source_date", "TEXT")
+        self.store._ensure_column("memories", "time_start", "TEXT")
+        self.store._ensure_column("memories", "time_end", "TEXT")
+        self.store.connection.execute("PRAGMA optimize")
 
     @property
     def mode(self) -> str:
@@ -130,6 +154,8 @@ class LongTermMemory:
         if self.embedder:
             try:
                 vectors = self.embedder.embed([item[1] for item in cleaned])
+                if len(vectors) != len(cleaned):
+                    raise ValueError("Embedding 返回数量与输入不一致")
                 signature = self.embedder.signature
             except Exception as error:
                 logging.getLogger(__name__).warning(
@@ -147,7 +173,8 @@ class LongTermMemory:
                     self.store.connection.execute(
                         "UPDATE memories SET content=?, category=?, importance=?, "
                         "last_seen=?, embedding=COALESCE(?, embedding), "
-                        "embedding_signature=COALESCE(?, embedding_signature) WHERE id=?",
+                        "embedding_signature=COALESCE(?, embedding_signature), "
+                        "temporal_status='current', confidence=1.0 WHERE id=?",
                         (content, category, max(importance, existing["importance"]), day,
                          encoded, signature, memory_id),
                     )
@@ -172,6 +199,109 @@ class LongTermMemory:
                 )
         return len(cleaned)
 
+    def begin_historical_document(self, document_id: int) -> None:
+        """Remove the previous extraction for one changed source without touching current memory."""
+        with self.store._lock, self.store.connection:
+            ids = [row[0] for row in self.store.connection.execute(
+                "SELECT DISTINCT memory_id FROM historical_memory_evidence WHERE document_id=?",
+                (document_id,),
+            ).fetchall()]
+            self.store.connection.execute(
+                "DELETE FROM historical_memory_evidence WHERE document_id=?", (document_id,)
+            )
+            for memory_id in ids:
+                current = self.store.connection.execute(
+                    "SELECT 1 FROM memory_sources WHERE memory_id=? LIMIT 1", (memory_id,)
+                ).fetchone()
+                historical = self.store.connection.execute(
+                    "SELECT 1 FROM historical_memory_evidence WHERE memory_id=? LIMIT 1",
+                    (memory_id,),
+                ).fetchone()
+                if not current and not historical:
+                    self.store.connection.execute(
+                        "DELETE FROM memory_fts WHERE memory_id=?", (memory_id,)
+                    )
+                    self.store.connection.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+
+    def remember_historical(self, items: list[dict], document: dict) -> int:
+        statuses = {"historical", "current", "uncertain"}
+        cleaned = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            content = str(item.get("content", "")).strip()
+            if not content:
+                continue
+            category = str(item.get("category", "other")).lower()
+            if category not in self.CATEGORIES:
+                category = "other"
+            status = str(item.get("status", "historical")).lower()
+            if status not in statuses:
+                status = "uncertain"
+            try:
+                importance = max(0.0, min(float(item.get("importance", 0.5)), 1.0))
+                confidence = max(0.0, min(float(item.get("confidence", 0.7)), 1.0))
+            except (TypeError, ValueError):
+                importance, confidence = 0.5, 0.7
+            cleaned.append((item, content, category, status, importance, confidence))
+        vectors = [None] * len(cleaned)
+        signature = None
+        if self.embedder and cleaned:
+            try:
+                vectors = self.embedder.embed([item[1] for item in cleaned])
+                if len(vectors) != len(cleaned):
+                    raise ValueError("Embedding 返回数量与输入不一致")
+                signature = self.embedder.signature
+            except Exception as error:
+                logging.getLogger(__name__).warning("历史长期记忆向量化失败：%s", error)
+        with self.store._lock, self.store.connection:
+            for (raw, content, category, status, importance, confidence), vector in zip(cleaned, vectors):
+                time_start = raw.get("time_start") or document["diary_date"]
+                time_end = raw.get("time_end") or document["diary_date"]
+                key = self._key(content)
+                existing = self.store.connection.execute(
+                    "SELECT id, importance, temporal_status FROM memories WHERE memory_key=?", (key,)
+                ).fetchone()
+                encoded = json.dumps(vector) if vector is not None else None
+                if existing:
+                    memory_id = int(existing["id"])
+                    merged_status = "current" if existing["temporal_status"] == "current" else status
+                    self.store.connection.execute(
+                        "UPDATE memories SET importance=?, confidence=MAX(confidence, ?), "
+                        "temporal_status=?, embedding=COALESCE(?, embedding), "
+                        "embedding_signature=COALESCE(?, embedding_signature), "
+                        "source_file=COALESCE(source_file, ?), source_date=COALESCE(source_date, ?), "
+                        "time_start=COALESCE(time_start, ?), time_end=COALESCE(time_end, ?) WHERE id=?",
+                        (max(importance, existing["importance"]), confidence, merged_status,
+                         encoded, signature, document["source_file"], document["diary_date"],
+                         time_start, time_end, memory_id),
+                    )
+                else:
+                    cursor = self.store.connection.execute(
+                        "INSERT INTO memories(memory_key, content, category, importance, first_seen, "
+                        "last_seen, embedding, embedding_signature, temporal_status, confidence, "
+                        "source_file, source_date, time_start, time_end) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (key, content, category, importance, document["diary_date"],
+                         document["diary_date"], encoded, signature, status, confidence,
+                         document["source_file"], document["diary_date"],
+                         time_start, time_end),
+                    )
+                    memory_id = int(cursor.lastrowid)
+                    self.store.connection.execute(
+                        "INSERT INTO memory_fts(memory_id, content) VALUES (?, ?)",
+                        (memory_id, content),
+                    )
+                self.store.connection.execute(
+                    "INSERT OR IGNORE INTO historical_memory_evidence(memory_id, document_id, "
+                    "source_file, source_date, time_start, time_end, confidence, temporal_status, snippet) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (memory_id, document["id"], document["source_file"], document["diary_date"],
+                     time_start, time_end, confidence, status,
+                     str(raw.get("evidence", ""))[:500]),
+                )
+        return len(cleaned)
+
     def forget_day(self, day: str) -> int:
         """Remove one day's contribution and delete memories with no other source day."""
         with self.store._lock, self.store.connection:
@@ -187,12 +317,24 @@ class LongTermMemory:
                     (memory_id,),
                 ).fetchone()
                 if dates[0] is None:
-                    self.store.connection.execute(
-                        "DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,)
-                    )
-                    self.store.connection.execute(
-                        "DELETE FROM memories WHERE id = ?", (memory_id,)
-                    )
+                    evidence = self.store.connection.execute(
+                        "SELECT MIN(source_date), MAX(source_date), "
+                        "CASE WHEN SUM(temporal_status='current')>0 THEN 'current' "
+                        "WHEN SUM(temporal_status='uncertain')>0 THEN 'uncertain' ELSE 'historical' END "
+                        "FROM historical_memory_evidence WHERE memory_id=?", (memory_id,)
+                    ).fetchone()
+                    if evidence and evidence[0] is not None:
+                        self.store.connection.execute(
+                            "UPDATE memories SET first_seen=?, last_seen=?, temporal_status=? WHERE id=?",
+                            (evidence[0], evidence[1], evidence[2], memory_id),
+                        )
+                    else:
+                        self.store.connection.execute(
+                            "DELETE FROM memory_fts WHERE memory_id = ?", (memory_id,)
+                        )
+                        self.store.connection.execute(
+                            "DELETE FROM memories WHERE id = ?", (memory_id,)
+                        )
                 else:
                     self.store.connection.execute(
                         "UPDATE memories SET first_seen=?, last_seen=? WHERE id=?",
@@ -229,6 +371,8 @@ class LongTermMemory:
                     embeddings = self.embedder.embed(
                         [row["content"] for row in missing]
                     )
+                    if len(embeddings) != len(missing):
+                        raise ValueError("Embedding 返回数量与输入不一致")
                     with self.store._lock, self.store.connection:
                         for row, embedding in zip(missing, embeddings):
                             encoded = json.dumps(embedding)
@@ -268,12 +412,16 @@ class LongTermMemory:
             id=item["id"], content=item["content"], category=item["category"],
             importance=item["importance"], first_seen=item["first_seen"],
             last_seen=item["last_seen"], score=item["score"],
+            temporal_status=item.get("temporal_status", "current"),
+            confidence=item.get("confidence", 1.0), source_file=item.get("source_file"),
+            source_date=item.get("source_date"),
         ) for item in ranked]
 
     def list(self) -> list[dict]:
         with self.store._lock:
             rows = self.store.connection.execute(
-                "SELECT id, content, category, importance, first_seen, last_seen "
+                "SELECT id, content, category, importance, first_seen, last_seen, "
+                "temporal_status, confidence, source_file, source_date, time_start, time_end "
                 "FROM memories ORDER BY last_seen DESC, importance DESC"
             ).fetchall()
         return [dict(row) for row in rows]

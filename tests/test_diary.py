@@ -27,6 +27,10 @@ class FakeProvider:
             "moments": ["下班时收到消息"], "emotions": ["开心"],
             "insights": [], "gratitude": [], "tomorrow": ["回复邮件"],
             "quote": "我终于松了口气", "tags": ["工作", "日记"],
+            "activities": [{
+                "title": "收到好消息", "description": "下班时收到消息",
+                "tags": ["工作"], "confidence": 0.95,
+            }],
             "memories": [{"content": "用户正在开发对话式日记应用", "category": "project", "importance": 0.8}],
         }
 
@@ -42,6 +46,19 @@ class FakeEmbedder:
 
 
 class DiaryTests(unittest.TestCase):
+    def test_chat_prompt_has_no_forced_question_or_round_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(root, "Daily", root / "diary.sqlite", ZoneInfo("UTC"),
+                                "fake", "fake", "", "", "小叶")
+            provider = FakeProvider()
+            service = DiaryService(settings, provider=provider,
+                                   store=DiaryStore(settings.database_path))
+            service.reply("我只是记录一下今天看了场电影")
+            system = provider.last_chat_messages[0]["content"]
+            self.assertIn("不要为了\n延长对话而硬问问题", system)
+            self.assertNotIn("6 至 10 轮", system)
+
     def test_service_persists_chat_and_writes_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -59,6 +76,7 @@ class DiaryTests(unittest.TestCase):
             self.assertIn("# 雨里的好消息", content)
             self.assertIn("> 我终于松了口气", content)
             self.assertEqual(service.memory.list()[0]["category"], "project")
+            self.assertEqual(service.activities.list_day(service.day)[0]["title"], "收到好消息")
 
     def test_writer_rejects_folder_outside_vault(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -101,6 +119,7 @@ class DiaryTests(unittest.TestCase):
             self.assertTrue(service.memory.list())
             self.assertTrue(service.delete_message(records[0]["id"]))
             self.assertFalse(service.memory.list())
+            self.assertFalse(service.activities.list_day(service.day))
 
     def test_memory_shared_by_two_days_survives_one_day_removal(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -142,6 +161,57 @@ class DiaryTests(unittest.TestCase):
                     client.delete(f"/v1/memories/{memory_id}").status_code, 200
                 )
                 self.assertEqual(client.get("/v1/memories").json()["memories"], [])
+
+    def test_todo_api_completion_feeds_review_calendar_not_future_plans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = Settings(root, "Daily", root / "diary.sqlite", ZoneInfo("UTC"),
+                                "fake", "fake", "", "", "小叶")
+            service = DiaryService(settings, provider=FakeProvider(),
+                                   store=DiaryStore(settings.database_path))
+            with TestClient(create_app(service)) as client:
+                future = client.post("/v1/todos", json={
+                    "title": "未来计划", "planned_date": "2099-01-01"
+                }).json()
+                completed = client.post("/v1/todos", json={"title": "已经做完的事"}).json()
+                self.assertEqual(
+                    client.post(f"/v1/todos/{completed['id']}/complete").status_code, 200
+                )
+                month = client.get(
+                    "/v1/review/month", params={"month": service.day[:7]}
+                ).json()
+                self.assertEqual(month["days"][0]["activity_count"], 1)
+                detail = client.get(f"/v1/review/day/{service.day}").json()
+                self.assertEqual(detail["completed_todos"][0]["title"], "已经做完的事")
+                self.assertNotIn("未来计划", str(detail))
+                self.assertEqual(service.todos.get(future["id"])["status"], "active")
+                self.assertEqual(client.get("/v1/review/day/2099-01-01").status_code, 404)
+
+    def test_history_scan_and_search_api_use_temporary_vault(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = root / "History"
+            history.mkdir()
+            (history / "2020-2-3.md").write_text(
+                "# 旧项目\n\n第一次整理长期项目资料。", encoding="utf-8"
+            )
+            settings = Settings(
+                root, "Daily", root / "diary.sqlite", ZoneInfo("UTC"),
+                "fake", "fake", "", "", "小叶", history_path=history,
+            )
+            service = DiaryService(settings, provider=FakeProvider(),
+                                   store=DiaryStore(settings.database_path))
+            with TestClient(create_app(service)) as client:
+                scanned = client.post("/v1/history/scan")
+                self.assertEqual(scanned.status_code, 200)
+                self.assertEqual(scanned.json()["imported"], 1)
+                found = client.get(
+                    "/v1/history/search", params={"q": "长期项目资料"}
+                ).json()
+                self.assertEqual(found["results"][0]["diary_date"], "2020-02-03")
+                self.assertEqual(client.post(
+                    "/v1/history/extract", json={"max_batches": 1}
+                ).status_code, 409)
 
 
 if __name__ == "__main__":

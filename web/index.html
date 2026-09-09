@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>拾光 · 对话日记</title>
   <link rel="stylesheet" href="/assets/styles.css?v=20260906-2">
-  <link rel="stylesheet" href="/assets/overrides.css?v=20260906-2">
+  <link rel="stylesheet" href="/assets/overrides.css?v=20260909-1">
 </head>
 <body>
   <div class="shell">
@@ -17,7 +17,8 @@
         <small id="fullDate">加载中</small>
       </div>
       <nav>
-        <button class="nav-item active"><span>◌</span><div><strong>今天的对话</strong><small id="messageCount">还没有开始</small></div></button>
+        <button class="nav-item active" id="chatNav"><span>◌</span><div><strong>今天的对话</strong><small id="messageCount">还没有开始</small></div></button>
+        <button class="nav-item" id="reviewNav"><span>▦</span><div><strong>回顾日历</strong><small>看看过去做了什么</small></div></button>
       </nav>
       <div class="sidebar-spacer"></div>
       <div class="privacy"><i></i><span>聊天和日记保存在你的电脑</span></div>
@@ -40,6 +41,25 @@
           </div>
         </div>
         <div class="messages" id="messages"></div>
+      </section>
+
+      <section class="review-calendar" id="reviewCalendar" hidden>
+        <div class="calendar-toolbar">
+          <div><span class="eyebrow">PAST DAYS</span><h1 id="calendarTitle">回顾日历</h1></div>
+          <div class="calendar-controls">
+            <button id="previousMonth" aria-label="上个月">←</button>
+            <button id="nextMonth" aria-label="下个月">→</button>
+          </div>
+        </div>
+        <div class="review-layout">
+          <div class="calendar-card">
+            <div class="weekday-row"><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>
+            <div class="calendar-grid" id="calendarGrid" aria-label="按月回顾"></div>
+          </div>
+          <aside class="day-review" id="dayReview">
+            <p class="review-empty">选择一个过去的日期，看看那天留下了什么。</p>
+          </aside>
+        </div>
       </section>
 
       <footer class="composer-area">
@@ -65,6 +85,6 @@
     <button class="primary wide" id="saveFromPreview">写入 Obsidian</button>
   </aside>
   <div class="toast" id="toast" role="status"></div>
-  <script src="/assets/app.js?v=20260906-3"></script>
+  <script src="/assets/app.js?v=20260909-1"></script>
 </body>
 </html>
