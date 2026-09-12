@@ -77,6 +77,11 @@ class HistoryExtractRequest(BaseModel):
     batch_size: int = Field(default=5, ge=1, le=20)
 
 
+class HistoryEmbedRequest(BaseModel):
+    max_batches: int = Field(default=20, ge=1, le=1000)
+    batch_size: int = Field(default=32, ge=1, le=256)
+
+
 def create_app(service: DiaryService | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -249,7 +254,10 @@ def create_app(service: DiaryService | None = None) -> FastAPI:
 
     @app.get("/v1/history/status")
     def history_status(diary: DiaryService = Depends(get_service)) -> dict:
-        return diary.history_index.status()
+        return {
+            **diary.history_index.status(),
+            "long_term_memory": diary.memory.status(),
+        }
 
     @app.get("/v1/history/search")
     def history_search(
@@ -278,6 +286,24 @@ def create_app(service: DiaryService | None = None) -> FastAPI:
             return diary.history_importer.extract(body.max_batches, body.batch_size)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+
+    @app.post("/v1/history/embed")
+    def history_embed(
+        body: HistoryEmbedRequest, diary: DiaryService = Depends(get_service)
+    ) -> dict:
+        try:
+            return {
+                "historical_chunks": diary.history_index.backfill_embeddings(
+                    body.batch_size, body.max_batches
+                ),
+                "long_term_memories": diary.memory.backfill_embeddings(
+                    body.batch_size, body.max_batches
+                ),
+            }
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
 
     web_dir = Path(__file__).with_name("web")
     app.mount("/assets", StaticFiles(directory=web_dir), name="assets")

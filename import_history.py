@@ -9,25 +9,42 @@ from diary_agent.service import DiaryService
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="增量导入 Obsidian 历史日记")
-    parser.add_argument("action", choices=("scan", "extract", "status", "search"))
+    parser.add_argument(
+        "action", choices=("scan", "embed", "extract", "status", "search")
+    )
     parser.add_argument("query", nargs="?", default="")
     parser.add_argument("--max-batches", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=5)
+    parser.add_argument("--batch-size", type=int)
     args = parser.parse_args()
     service = DiaryService(Settings.from_env())
     if args.action == "status":
-        result = service.history_index.status()
+        result = {
+            **service.history_index.status(),
+            "long_term_memory": service.memory.status(),
+        }
     elif args.action == "search":
         if not args.query:
             parser.error("search 需要查询文字")
         result = [item.__dict__ for item in service.history_index.search(args.query, 10)]
+    elif args.action == "embed":
+        batch_size = args.batch_size or 32
+        result = {
+            "historical_chunks": service.history_index.backfill_embeddings(
+                batch_size=batch_size, max_batches=args.max_batches
+            ),
+            "long_term_memories": service.memory.backfill_embeddings(
+                batch_size=batch_size, max_batches=args.max_batches
+            ),
+        }
     else:
         if not service.history_importer:
             raise SystemExit("请先在 .env 设置 OBSIDIAN_HISTORY_PATH")
         if args.action == "scan":
             result = service.history_importer.scan()
         else:
-            result = service.history_importer.extract(args.max_batches, args.batch_size)
+            result = service.history_importer.extract(
+                args.max_batches, args.batch_size or 5
+            )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

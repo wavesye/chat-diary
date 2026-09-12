@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import re
+import threading
 from dataclasses import dataclass
 
 from openai import OpenAI
@@ -25,18 +26,21 @@ class MemoryHit:
 
 
 class EmbeddingProvider:
-    def __init__(self, *, base_url: str, api_key: str, model: str):
+    def __init__(self, *, base_url: str, api_key: str, model: str,
+                 provider: str = "openai-compatible"):
         if not (base_url and api_key and model):
             raise ValueError(
-                "Hybrid 长期记忆需要设置 EMBEDDING_BASE_URL、"
-                "EMBEDDING_API_KEY 和 EMBEDDING_MODEL"
+                "Hybrid 长期记忆需要配置可用的 Embedding 服务地址、模型和凭据"
             )
         self.model = model
         self.base_url = base_url
+        self.provider = provider or "openai-compatible"
         self.client = OpenAI(api_key=api_key, base_url=base_url)
 
     @property
     def signature(self) -> str:
+        # Keep the original signature format so existing SQLite vectors remain
+        # compatible after upgrading. Endpoint + model define the embedding space.
         return f"{self.base_url}:{self.model}"
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -54,9 +58,13 @@ class LongTermMemory:
         "commitment", "life_event", "other",
     }
 
-    def __init__(self, store, embedder=None):
+    def __init__(self, store, embedder=None, search_mode: str = "hybrid",
+                 vector_min_similarity: float = 0.1):
         self.store = store
         self.embedder = embedder
+        self.configured_search_mode = self._validate_search_mode(search_mode)
+        self.vector_min_similarity = self._validate_similarity(vector_min_similarity)
+        self._embedding_job_lock = threading.Lock()
         with self.store._lock:
             self.store.connection.executescript(
                 """
@@ -107,7 +115,37 @@ class LongTermMemory:
 
     @property
     def mode(self) -> str:
-        return "hybrid" if self.embedder else "keyword"
+        if not self.vector_enabled:
+            return "keyword"
+        with self.store._lock:
+            available = self.store.connection.execute(
+                "SELECT 1 FROM memories WHERE embedding IS NOT NULL "
+                "AND embedding_signature=? LIMIT 1", (self.embedder.signature,),
+            ).fetchone()
+        return self.configured_search_mode if available else "keyword"
+
+    @property
+    def vector_enabled(self) -> bool:
+        return bool(
+            self.embedder and self.configured_search_mode in {"hybrid", "vector"}
+        )
+
+    @staticmethod
+    def _validate_search_mode(value: str) -> str:
+        mode = (value or "hybrid").strip().lower()
+        if mode not in {"hybrid", "vector", "keyword"}:
+            raise ValueError("search_mode 只能是 hybrid、vector 或 keyword")
+        return mode
+
+    @staticmethod
+    def _validate_similarity(value: float) -> float:
+        try:
+            threshold = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("向量相似度阈值必须是 -1 到 1 之间的数字") from None
+        if not math.isfinite(threshold) or not -1.0 <= threshold <= 1.0:
+            raise ValueError("向量相似度阈值必须是 -1 到 1 之间的数字")
+        return threshold
 
     @staticmethod
     def _key(content: str) -> str:
@@ -120,6 +158,35 @@ class LongTermMemory:
         dot = sum(a * b for a, b in zip(left, right))
         norm = math.sqrt(sum(a * a for a in left) * sum(b * b for b in right))
         return dot / norm if norm else -1.0
+
+    @classmethod
+    def _rank_vectors(cls, rows: list[dict], query_vector: list[float],
+                      limit: int, min_similarity: float) -> list[dict]:
+        """Rank valid vectors while isolating corrupt/incompatible SQLite rows."""
+        try:
+            query = [float(item) for item in query_vector]
+        except (TypeError, ValueError):
+            return []
+        if not query or not all(math.isfinite(item) for item in query):
+            return []
+        scored = []
+        for row in rows:
+            try:
+                value = json.loads(row["embedding"])
+                if not isinstance(value, list) or len(value) != len(query):
+                    continue
+                vector = [float(item) for item in value]
+                if not all(math.isfinite(item) for item in vector):
+                    continue
+                score = cls._cosine(query, vector)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if math.isfinite(score) and score > min_similarity:
+                item = dict(row)
+                item["_vector_score"] = score
+                scored.append(item)
+        scored.sort(key=lambda item: item["_vector_score"], reverse=True)
+        return scored[:limit]
 
     @staticmethod
     def _match_expression(query: str) -> str | None:
@@ -151,7 +218,7 @@ class LongTermMemory:
 
         vectors = [None] * len(cleaned)
         signature = None
-        if self.embedder:
+        if self.vector_enabled:
             try:
                 vectors = self.embedder.embed([item[1] for item in cleaned])
                 if len(vectors) != len(cleaned):
@@ -246,7 +313,7 @@ class LongTermMemory:
             cleaned.append((item, content, category, status, importance, confidence))
         vectors = [None] * len(cleaned)
         signature = None
-        if self.embedder and cleaned:
+        if self.vector_enabled and cleaned:
             try:
                 vectors = self.embedder.embed([item[1] for item in cleaned])
                 if len(vectors) != len(cleaned):
@@ -342,11 +409,82 @@ class LongTermMemory:
                     )
         return len(ids)
 
-    def search(self, query: str, top_k: int = 5) -> list[MemoryHit]:
+    def backfill_embeddings(self, batch_size: int = 32,
+                            max_batches: int = 20) -> dict:
+        """Embed missing/stale rows in committed batches so the job is resumable."""
+        if not self.embedder:
+            raise ValueError("未配置 Embedding 模型，无法补建长期记忆向量")
+        batch_size = max(1, min(int(batch_size), 256))
+        max_batches = max(1, int(max_batches))
+        processed = 0
+        with self._embedding_job_lock:
+            for _ in range(max_batches):
+                with self.store._lock:
+                    batch = [dict(row) for row in self.store.connection.execute(
+                        "SELECT id, content FROM memories "
+                        "WHERE embedding IS NULL OR embedding_signature IS NULL "
+                        "OR embedding_signature != ? ORDER BY id LIMIT ?",
+                        (self.embedder.signature, batch_size),
+                    ).fetchall()]
+                if not batch:
+                    break
+                values = self.embedder.embed([row["content"] for row in batch])
+                if len(values) != len(batch):
+                    raise ValueError("Embedding 返回数量与输入不一致")
+                with self.store._lock, self.store.connection:
+                    for row, value in zip(batch, values):
+                        self.store.connection.execute(
+                            "UPDATE memories SET embedding=?, embedding_signature=? WHERE id=?",
+                            (json.dumps(value), self.embedder.signature, row["id"]),
+                        )
+                processed += len(batch)
+        status = self.status()
+        return {"processed_embeddings": processed, **status}
+
+    def status(self) -> dict:
+        signature = self.embedder.signature if self.embedder else None
+        with self.store._lock:
+            total = int(self.store.connection.execute(
+                "SELECT COUNT(*) FROM memories"
+            ).fetchone()[0])
+            if signature:
+                embedded = int(self.store.connection.execute(
+                    "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL "
+                    "AND embedding_signature=?", (signature,),
+                ).fetchone()[0])
+            else:
+                # Stored vectors cannot be queried safely without knowing the
+                # provider/model signature currently in use.
+                embedded = 0
+        active_mode = (
+            self.configured_search_mode if self.vector_enabled and embedded else "keyword"
+        )
+        fallback_reason = None
+        if self.configured_search_mode != "keyword":
+            if not self.embedder:
+                fallback_reason = "embedding_not_configured"
+            elif total and not embedded:
+                fallback_reason = "embeddings_not_built"
+        return {
+            "configured_search_mode": self.configured_search_mode,
+            "search_mode": active_mode,
+            "memories": total,
+            "embedded_memories": embedded,
+            "pending_embeddings": total - embedded,
+            "embedding_provider": getattr(self.embedder, "provider", None),
+            "embedding_model": getattr(self.embedder, "model", None),
+            "embedding_signature": signature,
+            "vector_min_similarity": self.vector_min_similarity,
+            "fallback_reason": fallback_reason,
+        }
+
+    def search(self, query: str, top_k: int = 5,
+               query_vector: list[float] | None = None) -> list[MemoryHit]:
         top_k = max(1, min(top_k, 10))
         candidate_count = top_k * 4
+        mode = self.mode
         lexical = []
-        expression = self._match_expression(query)
+        expression = self._match_expression(query) if mode != "vector" else None
         with self.store._lock:
             if expression:
                 rows = self.store.connection.execute(
@@ -355,51 +493,39 @@ class LongTermMemory:
                     (expression, candidate_count),
                 ).fetchall()
                 lexical = [dict(row) for row in rows]
-            all_rows = [dict(row) for row in self.store.connection.execute(
-                "SELECT * FROM memories ORDER BY importance DESC"
-            ).fetchall()]
+            vector_rows = []
+            if self.embedder and mode != "keyword":
+                vector_rows = [dict(row) for row in self.store.connection.execute(
+                    "SELECT * FROM memories WHERE embedding IS NOT NULL "
+                    "AND embedding_signature=? ORDER BY importance DESC",
+                    (self.embedder.signature,),
+                ).fetchall()]
 
         vector = []
-        if self.embedder and all_rows:
+        if self.embedder and vector_rows and mode != "keyword":
             try:
-                missing = [
-                    row for row in all_rows
-                    if not row["embedding"]
-                    or row["embedding_signature"] != self.embedder.signature
-                ]
-                if missing:
-                    embeddings = self.embedder.embed(
-                        [row["content"] for row in missing]
-                    )
-                    if len(embeddings) != len(missing):
-                        raise ValueError("Embedding 返回数量与输入不一致")
-                    with self.store._lock, self.store.connection:
-                        for row, embedding in zip(missing, embeddings):
-                            encoded = json.dumps(embedding)
-                            self.store.connection.execute(
-                                "UPDATE memories SET embedding=?, "
-                                "embedding_signature=? WHERE id=?",
-                                (encoded, self.embedder.signature, row["id"]),
-                            )
-                            row["embedding"] = encoded
-                            row["embedding_signature"] = self.embedder.signature
-                query_vector = self.embedder.embed([query])[0]
-                compatible = [row for row in all_rows if row["embedding"] and
-                              row["embedding_signature"] == self.embedder.signature]
-                vector = sorted(
-                    compatible,
-                    key=lambda row: self._cosine(
-                        query_vector, json.loads(row["embedding"])
-                    ),
-                    reverse=True,
-                )[:candidate_count]
+                active_query_vector = (
+                    self.embedder.embed([query])[0]
+                    if query_vector is None else query_vector
+                )
+                vector = self._rank_vectors(
+                    vector_rows, active_query_vector, candidate_count,
+                    self.vector_min_similarity,
+                )
             except Exception as error:
                 logging.getLogger(__name__).warning(
-                    "Embedding 检索失败，本次降级为 FTS5：%s", error
+                    "Embedding 检索失败%s：%s",
+                    "，本次仅使用 FTS5" if mode == "hybrid" else "",
+                    error,
                 )
 
         fused: dict[int, dict] = {}
-        for weight, candidates in ((0.4, lexical), (0.6, vector)):
+        candidate_groups = []
+        if mode != "vector":
+            candidate_groups.append((0.4, lexical))
+        if mode != "keyword":
+            candidate_groups.append((0.6, vector))
+        for weight, candidates in candidate_groups:
             for rank, item in enumerate(candidates, 1):
                 entry = fused.setdefault(item["id"], dict(item, score=0.0))
                 entry["score"] += weight / (60 + rank)

@@ -39,6 +39,10 @@ class Settings:
     history_extract_model: str = ""
     history_extract_base_url: str = ""
     history_extract_api_key: str = ""
+    todo_multilingual_model_fallback: bool = True
+    embedding_provider: str = ""
+    memory_search_mode: str = "hybrid"
+    memory_vector_min_similarity: float = 0.1
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -80,6 +84,54 @@ class Settings:
         )
         if history_model and not history_base_url:
             raise ValueError("设置 HISTORY_LLM_MODEL 后还需要可用的 HISTORY_LLM_BASE_URL")
+
+        search_mode = os.getenv("MEMORY_SEARCH_MODE", "hybrid").strip().lower()
+        if search_mode not in {"hybrid", "vector", "keyword"}:
+            raise ValueError("MEMORY_SEARCH_MODE 只能是 hybrid、vector 或 keyword")
+        try:
+            vector_min_similarity = float(os.getenv(
+                "MEMORY_VECTOR_MIN_SIMILARITY", "0.1"
+            ))
+        except ValueError:
+            raise ValueError(
+                "MEMORY_VECTOR_MIN_SIMILARITY 必须是 -1 到 1 之间的数字"
+            ) from None
+        if not -1.0 <= vector_min_similarity <= 1.0:
+            raise ValueError(
+                "MEMORY_VECTOR_MIN_SIMILARITY 必须是 -1 到 1 之间的数字"
+            )
+
+        embedding_provider = os.getenv("EMBEDDING_PROVIDER", "").strip().lower()
+        generic_embedding_configured = any(os.getenv(name, "").strip() for name in (
+            "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
+        ))
+        if not embedding_provider and generic_embedding_configured:
+            # Backwards compatibility with the original three-variable setup.
+            embedding_provider = "openai-compatible"
+        if embedding_provider in {"openai", "compatible"}:
+            embedding_provider = "openai-compatible"
+        if embedding_provider not in {"", "ollama", "openai-compatible"}:
+            raise ValueError(
+                "EMBEDDING_PROVIDER 只能是 ollama 或 openai-compatible"
+            )
+        if embedding_provider == "ollama":
+            embedding_base_url = (
+                os.getenv("OLLAMA_EMBEDDING_BASE_URL", "").strip()
+                or "http://127.0.0.1:11434/v1"
+            ).rstrip("/")
+            embedding_api_key = (
+                os.getenv("OLLAMA_API_KEY", "").strip()
+                or "ollama"
+            )
+            embedding_model = os.getenv("OLLAMA_EMBEDDING_MODEL", "").strip()
+        else:
+            embedding_base_url = os.getenv("EMBEDDING_BASE_URL", "").strip().rstrip("/")
+            embedding_api_key = os.getenv("EMBEDDING_API_KEY", "").strip()
+            embedding_model = os.getenv("EMBEDDING_MODEL", "").strip()
+        if embedding_model and not embedding_base_url:
+            raise ValueError("设置 EMBEDDING_MODEL 后还需要 EMBEDDING_BASE_URL")
+        if embedding_model and not embedding_api_key and embedding_provider != "ollama":
+            raise ValueError("设置 EMBEDDING_MODEL 后还需要 EMBEDDING_API_KEY")
         return cls(
             vault_path=Path(vault).expanduser().resolve(),
             journal_folder=os.getenv("OBSIDIAN_JOURNAL_FOLDER", "日记/AI 日记"),
@@ -90,9 +142,12 @@ class Settings:
             base_url=base_url,
             api_key=api_key or "ollama",
             user_name=os.getenv("DIARY_USER_NAME", "你"),
-            embedding_base_url=os.getenv("EMBEDDING_BASE_URL", "").rstrip("/"),
-            embedding_api_key=os.getenv("EMBEDDING_API_KEY", ""),
-            embedding_model=os.getenv("EMBEDDING_MODEL", ""),
+            embedding_base_url=embedding_base_url,
+            embedding_api_key=embedding_api_key,
+            embedding_model=embedding_model,
+            embedding_provider=embedding_provider,
+            memory_search_mode=search_mode,
+            memory_vector_min_similarity=vector_min_similarity,
             memory_top_k=max(1, min(int(os.getenv("MEMORY_TOP_K", "5")), 10)),
             todo_reminders_enabled=os.getenv("TODO_REMINDERS_ENABLED", "true").lower()
             not in {"0", "false", "no", "off"},
@@ -102,4 +157,7 @@ class Settings:
             history_extract_model=history_model,
             history_extract_base_url=history_base_url,
             history_extract_api_key=history_api_key,
+            todo_multilingual_model_fallback=os.getenv(
+                "TODO_MULTILINGUAL_MODEL_FALLBACK", "true"
+            ).lower() not in {"0", "false", "no", "off"},
         )

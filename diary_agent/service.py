@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 
 from .config import Settings
@@ -22,25 +23,36 @@ class DiaryService:
             api_key=settings.api_key, base_url=settings.base_url, model=settings.model
         )
         self.store = store or DiaryStore(settings.database_path)
+        embedder = getattr(memory, "embedder", None) if memory is not None else None
         if memory is not None:
             self.memory = memory
         else:
-            embedder = None
             if settings.embedding_model:
                 embedder = EmbeddingProvider(
                     base_url=settings.embedding_base_url,
                     api_key=settings.embedding_api_key,
                     model=settings.embedding_model,
+                    provider=settings.embedding_provider,
                 )
-            self.memory = LongTermMemory(self.store, embedder)
+            self.memory = LongTermMemory(
+                self.store, embedder, search_mode=settings.memory_search_mode,
+                vector_min_similarity=settings.memory_vector_min_similarity,
+            )
+        self.embedder = embedder
         self.todos = TodoService(self.store, settings.timezone)
         self.activities = ActivityService(self.store)
-        self.task_extractor = TaskExtractor(self.provider, settings.timezone)
+        self.task_extractor = TaskExtractor(
+            self.provider, settings.timezone,
+            multilingual_model_fallback=settings.todo_multilingual_model_fallback,
+        )
         self.reminders = ReminderService(
             self.store, settings.timezone, settings.todo_morning_time,
             settings.todo_evening_time, settings.todo_reminders_enabled,
         )
-        self.history_index = HistoricalMemoryIndex(self.store, embedder)
+        self.history_index = HistoricalMemoryIndex(
+            self.store, embedder, search_mode=settings.memory_search_mode,
+            vector_min_similarity=settings.memory_vector_min_similarity,
+        )
         history_provider = None
         if settings.history_extract_model:
             history_provider = ChatProvider(
@@ -69,13 +81,41 @@ class DiaryService:
         return answer
 
     def reply_with_record(self, text: str) -> tuple[str, int]:
-        clean = text.strip()
-        if not clean:
+        answer, message_ids = self.reply_many_with_record([text])
+        return answer, message_ids[0]
+
+    def reply_many_with_record(self, texts: list[str]) -> tuple[str, list[int]]:
+        clean_messages = [text.strip() for text in texts if text.strip()]
+        if not clean_messages:
             raise ValueError("消息不能为空")
-        message_id = self.store.add_message(self.day, "user", clean)
+        message_ids = self.store.add_messages(self.day, "user", clean_messages)
         history = self.store.messages(self.day)
-        recalled = self.memory.search(clean, self.settings.memory_top_k)
-        historical = self.history_index.search(clean, min(3, self.settings.memory_top_k))
+        recall_query = "\n".join(clean_messages)
+        shared_query_vector = None
+        share_embedding = bool(
+            self.embedder and (
+                self.memory.mode != "keyword"
+                or self.history_index.mode != "keyword"
+            )
+        )
+        if share_embedding:
+            try:
+                shared_query_vector = self.embedder.embed([recall_query])[0]
+            except Exception as error:
+                # An empty vector explicitly tells both searches not to retry the
+                # same failed/sensitive request independently.
+                shared_query_vector = []
+                logging.getLogger(__name__).warning(
+                    "记忆查询向量生成失败，本次仅使用 FTS5：%s", error
+                )
+        recalled = self.memory.search(
+            recall_query, self.settings.memory_top_k,
+            query_vector=shared_query_vector if share_embedding else None,
+        )
+        historical = self.history_index.search(
+            recall_query, min(3, self.settings.memory_top_k),
+            query_vector=shared_query_vector if share_embedding else None,
+        )
         system = CHAT_SYSTEM
         if recalled:
             memory_context = [
@@ -110,7 +150,7 @@ class DiaryService:
             )
         answer = self.provider.chat([{"role": "system", "content": system}, *history])
         self.store.add_message(self.day, "assistant", answer)
-        return answer, message_id
+        return answer, message_ids
 
     def delete_message(self, message_id: int) -> bool:
         deleted = self.store.delete_message(self.day, message_id)

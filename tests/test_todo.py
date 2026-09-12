@@ -1,7 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -13,6 +13,16 @@ from diary_agent.todo import TaskExtractor, TodoService, parse_due_at, parse_rel
 class BrokenProvider:
     def json(self, messages):
         raise RuntimeError("model unavailable")
+
+
+class StaticProvider:
+    def __init__(self, response):
+        self.response = response
+        self.calls = 0
+
+    def json(self, messages):
+        self.calls += 1
+        return self.response
 
 
 class TodoTests(unittest.TestCase):
@@ -79,6 +89,97 @@ class TodoTests(unittest.TestCase):
         self.assertEqual(
             parse_relative_date("下周一", date(2026, 9, 9)), "2026-09-14"
         )
+
+    def test_english_rules_cover_create_complete_postpone_and_deadline(self):
+        extractor = TaskExtractor(BrokenProvider(), ZoneInfo("Asia/Shanghai"))
+        today = date(2026, 9, 9)
+        created = extractor._rules(
+            "Remind me tomorrow to revise section two", today
+        )
+        self.assertEqual(created.action, "create")
+        self.assertEqual(created.title, "revise section two")
+        self.assertEqual(created.planned_date, "2026-09-10")
+        completed = extractor._rules("I finished revising section two", today)
+        self.assertEqual(completed.action, "complete")
+        self.assertEqual(completed.title, "revising section two")
+        postponed = extractor._rules(
+            "Postpone BMS analysis until next Friday", today
+        )
+        self.assertEqual(postponed.action, "postpone")
+        self.assertEqual(postponed.title, "BMS analysis")
+        self.assertEqual(postponed.planned_date, "2026-09-18")
+        deadline = extractor._rules(
+            "Submit the paper by tomorrow at 3pm", today
+        )
+        self.assertIsNone(deadline.planned_date)
+        self.assertEqual(deadline.due_at, "2026-09-10T15:00:00+08:00")
+        scheduled = extractor._rules(
+            "Schedule submit paper for September 12", today
+        )
+        self.assertEqual(scheduled.title, "submit paper")
+        self.assertEqual(scheduled.planned_date, "2026-09-12")
+
+    def test_other_language_uses_model_with_verbatim_date_evidence(self):
+        timezone = ZoneInfo("Asia/Shanghai")
+        tomorrow = (datetime.now(timezone).date() + timedelta(days=1)).isoformat()
+        provider = StaticProvider({
+            "action": "create",
+            "title": "revisar la segunda sección",
+            "description": "",
+            "planned_date": tomorrow,
+            "planned_date_evidence": "mañana",
+            "due_at": None,
+            "due_at_evidence": None,
+            "priority": 3,
+            "confidence": 0.95,
+            "needs_confirmation": False,
+        })
+        extractor = TaskExtractor(provider, timezone)
+        intent = extractor.extract(
+            "Recuérdame revisar la segunda sección mañana", source_message_id=42
+        )
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(intent.action, "create")
+        self.assertEqual(intent.planned_date, tomorrow)
+        self.assertEqual(intent.source_message_id, 42)
+
+    def test_multilingual_fallback_can_be_disabled(self):
+        provider = StaticProvider({"action": "create", "title": "comprar leche"})
+        extractor = TaskExtractor(
+            provider, ZoneInfo("Asia/Shanghai"), multilingual_model_fallback=False
+        )
+        self.assertIsNone(extractor.extract("Recuérdame comprar leche"))
+        self.assertEqual(provider.calls, 0)
+
+    def test_model_none_can_veto_a_date_mention_that_is_not_a_task(self):
+        provider = StaticProvider({"action": "none"})
+        extractor = TaskExtractor(provider, ZoneInfo("Asia/Shanghai"))
+        self.assertIsNone(extractor.extract("I felt happy today"))
+        self.assertEqual(provider.calls, 1)
+
+    def test_list_question_is_read_only_even_when_model_would_create(self):
+        provider = StaticProvider({
+            "action": "create", "title": "我现在的todo list有什么"
+        })
+        extractor = TaskExtractor(provider, ZoneInfo("Asia/Shanghai"))
+        intent = extractor.extract("我现在的todo list有什么")
+        self.assertEqual(intent.action, "list")
+        self.assertEqual(provider.calls, 0)
+
+    def test_explicit_chinese_todo_write_cannot_be_vetoed_by_model(self):
+        provider = StaticProvider({"action": "none"})
+        extractor = TaskExtractor(provider, ZoneInfo("Asia/Shanghai"))
+        created = extractor.extract("今天做10个俯卧撑，加入todo")
+        self.assertEqual(created.action, "create")
+        self.assertEqual(created.title, "做10个俯卧撑")
+        self.assertEqual(provider.calls, 0)
+        completed = extractor.extract("10个俯卧撑已完成")
+        self.assertEqual(completed.action, "complete")
+        self.assertEqual(completed.title, "10个俯卧撑")
+        paper = extractor.extract("论文已经改完了")
+        self.assertEqual(paper.action, "complete")
+        self.assertEqual(paper.title, "论文")
+        self.assertEqual(provider.calls, 0)
 
     def test_existing_database_data_survives_additive_migration(self):
         legacy_path = Path(self.temp.name) / "legacy.sqlite"

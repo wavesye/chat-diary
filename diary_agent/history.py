@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -23,9 +24,15 @@ class HistoricalHit:
 class HistoricalMemoryIndex:
     """First memory layer: immutable source documents and searchable raw chunks."""
 
-    def __init__(self, store, embedder=None):
+    def __init__(self, store, embedder=None, search_mode: str = "hybrid",
+                 vector_min_similarity: float = 0.1):
         self.store = store
         self.embedder = embedder
+        self.configured_search_mode = LongTermMemory._validate_search_mode(search_mode)
+        self.vector_min_similarity = LongTermMemory._validate_similarity(
+            vector_min_similarity
+        )
+        self._embedding_job_lock = threading.Lock()
         with store._lock:
             store.connection.executescript(
                 """
@@ -72,12 +79,62 @@ class HistoricalMemoryIndex:
 
     @property
     def mode(self) -> str:
-        return "hybrid" if self.embedder else "keyword"
+        if not self.vector_enabled:
+            return "keyword"
+        with self.store._lock:
+            available = self.store.connection.execute(
+                "SELECT 1 FROM historical_chunks WHERE embedding IS NOT NULL "
+                "AND embedding_signature=? LIMIT 1", (self.embedder.signature,),
+            ).fetchone()
+        return self.configured_search_mode if available else "keyword"
 
-    def search(self, query: str, top_k: int = 4) -> list[HistoricalHit]:
+    @property
+    def vector_enabled(self) -> bool:
+        return bool(
+            self.embedder and self.configured_search_mode in {"hybrid", "vector"}
+        )
+
+    def backfill_embeddings(self, batch_size: int = 32,
+                            max_batches: int = 20) -> dict:
+        """Embed missing/stale historical chunks in resumable committed batches."""
+        if not self.embedder:
+            raise ValueError("未配置 Embedding 模型，无法补建历史日记向量")
+        batch_size = max(1, min(int(batch_size), 256))
+        max_batches = max(1, int(max_batches))
+        processed = 0
+        with self._embedding_job_lock:
+            for _ in range(max_batches):
+                with self.store._lock:
+                    batch = [dict(row) for row in self.store.connection.execute(
+                        "SELECT id, content FROM historical_chunks "
+                        "WHERE embedding IS NULL OR embedding_signature IS NULL "
+                        "OR embedding_signature != ? ORDER BY id LIMIT ?",
+                        (self.embedder.signature, batch_size),
+                    ).fetchall()]
+                if not batch:
+                    break
+                values = self.embedder.embed([row["content"] for row in batch])
+                if len(values) != len(batch):
+                    raise ValueError("Embedding 返回数量与输入不一致")
+                with self.store._lock, self.store.connection:
+                    for row, value in zip(batch, values):
+                        self.store.connection.execute(
+                            "UPDATE historical_chunks SET embedding=?, "
+                            "embedding_signature=? WHERE id=?",
+                            (json.dumps(value), self.embedder.signature, row["id"]),
+                        )
+                processed += len(batch)
+        status = self.status()
+        return {"processed_embeddings": processed, **status}
+
+    def search(self, query: str, top_k: int = 4,
+               query_vector: list[float] | None = None) -> list[HistoricalHit]:
         top_k = max(1, min(top_k, 10))
         candidate_count = top_k * 4
-        expression = LongTermMemory._match_expression(query)
+        mode = self.mode
+        expression = (
+            LongTermMemory._match_expression(query) if mode != "vector" else None
+        )
         lexical = []
         with self.store._lock:
             if expression:
@@ -88,41 +145,39 @@ class HistoricalMemoryIndex:
                     "WHERE historical_chunk_fts MATCH ? ORDER BY bm25(historical_chunk_fts) LIMIT ?",
                     (expression, candidate_count),
                 ).fetchall()]
-            rows = [dict(row) for row in self.store.connection.execute(
-                "SELECT c.*, d.source_file, d.diary_date FROM historical_chunks c "
-                "JOIN historical_documents d ON d.id=c.document_id ORDER BY d.diary_date DESC"
-            ).fetchall()]
+            rows = []
+            if self.embedder and mode != "keyword":
+                rows = [dict(row) for row in self.store.connection.execute(
+                    "SELECT c.*, d.source_file, d.diary_date FROM historical_chunks c "
+                    "JOIN historical_documents d ON d.id=c.document_id "
+                    "WHERE c.embedding IS NOT NULL AND c.embedding_signature=? "
+                    "ORDER BY d.diary_date DESC",
+                    (self.embedder.signature,),
+                ).fetchall()]
         vector = []
-        if self.embedder and rows:
+        if self.embedder and rows and mode != "keyword":
             try:
-                missing = [row for row in rows if not row["embedding"] or
-                           row["embedding_signature"] != self.embedder.signature]
-                for start in range(0, len(missing), 32):
-                    batch = missing[start:start + 32]
-                    values = self.embedder.embed([row["content"] for row in batch])
-                    if len(values) != len(batch):
-                        raise ValueError("Embedding 返回数量与输入不一致")
-                    with self.store._lock, self.store.connection:
-                        for row, value in zip(batch, values):
-                            encoded = json.dumps(value)
-                            self.store.connection.execute(
-                                "UPDATE historical_chunks SET embedding=?, embedding_signature=? WHERE id=?",
-                                (encoded, self.embedder.signature, row["id"]),
-                            )
-                            row["embedding"], row["embedding_signature"] = encoded, self.embedder.signature
-                query_vector = self.embedder.embed([query])[0]
-                compatible = [row for row in rows if row["embedding"] and
-                              row["embedding_signature"] == self.embedder.signature]
-                vector = sorted(
-                    compatible,
-                    key=lambda row: LongTermMemory._cosine(
-                        query_vector, json.loads(row["embedding"])
-                    ), reverse=True,
-                )[:candidate_count]
+                active_query_vector = (
+                    self.embedder.embed([query])[0]
+                    if query_vector is None else query_vector
+                )
+                vector = LongTermMemory._rank_vectors(
+                    rows, active_query_vector, candidate_count,
+                    self.vector_min_similarity,
+                )
             except Exception as error:
-                logging.getLogger(__name__).warning("历史原文向量检索失败，降级到 FTS5：%s", error)
+                logging.getLogger(__name__).warning(
+                    "历史原文向量检索失败%s：%s",
+                    "，本次仅使用 FTS5" if mode == "hybrid" else "",
+                    error,
+                )
         fused = {}
-        for weight, candidates in ((0.4, lexical), (0.6, vector)):
+        candidate_groups = []
+        if mode != "vector":
+            candidate_groups.append((0.4, lexical))
+        if mode != "keyword":
+            candidate_groups.append((0.6, vector))
+        for weight, candidates in candidate_groups:
             for rank, item in enumerate(candidates, 1):
                 fused.setdefault(item["id"], dict(item, score=0.0))["score"] += weight / (60 + rank)
         ranked = sorted(fused.values(), key=lambda item: item["score"], reverse=True)[:top_k]
@@ -132,6 +187,7 @@ class HistoricalMemoryIndex:
         ) for item in ranked]
 
     def status(self) -> dict:
+        signature = self.embedder.signature if self.embedder else None
         with self.store._lock:
             documents = self.store.connection.execute(
                 "SELECT COUNT(*) FROM historical_documents"
@@ -143,8 +199,36 @@ class HistoricalMemoryIndex:
                 "SELECT COUNT(*) FROM historical_documents "
                 "WHERE extraction_status IN ('pending','processing')"
             ).fetchone()[0]
-        return {"documents": documents, "chunks": chunks, "pending_extraction": pending,
-                "search_mode": self.mode}
+            if signature:
+                embedded = int(self.store.connection.execute(
+                    "SELECT COUNT(*) FROM historical_chunks WHERE embedding IS NOT NULL "
+                    "AND embedding_signature=?", (signature,),
+                ).fetchone()[0])
+            else:
+                embedded = 0
+        active_mode = (
+            self.configured_search_mode if self.vector_enabled and embedded else "keyword"
+        )
+        fallback_reason = None
+        if self.configured_search_mode != "keyword":
+            if not self.embedder:
+                fallback_reason = "embedding_not_configured"
+            elif chunks and not embedded:
+                fallback_reason = "embeddings_not_built"
+        return {
+            "documents": documents,
+            "chunks": chunks,
+            "pending_extraction": pending,
+            "configured_search_mode": self.configured_search_mode,
+            "search_mode": active_mode,
+            "embedded_chunks": embedded,
+            "pending_embeddings": chunks - embedded,
+            "embedding_provider": getattr(self.embedder, "provider", None),
+            "embedding_model": getattr(self.embedder, "model", None),
+            "embedding_signature": signature,
+            "vector_min_similarity": self.vector_min_similarity,
+            "fallback_reason": fallback_reason,
+        }
 
 
 class ObsidianHistoryImporter:
@@ -262,7 +346,7 @@ class ObsidianHistoryImporter:
                 chunks = self._chunks(body)
                 vectors = [None] * len(chunks)
                 signature = None
-                if self.index.embedder and chunks:
+                if self.index.vector_enabled and chunks:
                     try:
                         vectors = []
                         for start in range(0, len(chunks), 32):

@@ -115,6 +115,18 @@ class DiaryStore:
                 )
         return int(cursor.lastrowid)
 
+    def add_messages(self, day: str, role: str, contents: list[str]) -> list[int]:
+        """Insert one message burst atomically while preserving message boundaries."""
+        ids = []
+        with self._lock, self.connection:
+            for content in contents:
+                cursor = self.connection.execute(
+                    "INSERT INTO messages(day, role, content) VALUES (?, ?, ?)",
+                    (day, role, content),
+                )
+                ids.append(int(cursor.lastrowid))
+        return ids
+
     def messages(self, day: str) -> list[dict[str, str]]:
         with self._lock:
             rows = self.connection.execute(

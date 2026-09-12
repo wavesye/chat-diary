@@ -1,13 +1,18 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi.testclient import TestClient
+from openai import APITimeoutError
 
 from api import create_app
 from diary_agent.config import Settings
 from diary_agent.memory import LongTermMemory
+from diary_agent.provider import ChatProvider, ProviderResponseError
 from diary_agent.service import DiaryService
 from diary_agent.store import DiaryStore
 from diary_agent.writer import entry_filename, render_markdown, write_entry
@@ -45,7 +50,45 @@ class FakeEmbedder:
         ]
 
 
+class CompletionSequence:
+    def __init__(self, items):
+        self.items = list(items)
+        self.calls = 0
+
+    def create(self, **request):
+        item = self.items[self.calls]
+        self.calls += 1
+        if isinstance(item, Exception):
+            raise item
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=item))]
+        )
+
+
 class DiaryTests(unittest.TestCase):
+    def test_provider_retries_a_temporary_timeout(self):
+        request = httpx.Request("POST", "https://model.example/v1/chat/completions")
+        completions = CompletionSequence([APITimeoutError(request), "恢复后的回复"])
+        provider = ChatProvider.__new__(ChatProvider)
+        provider.model = "fake"
+        provider.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+        with patch("diary_agent.provider.time.sleep") as sleep:
+            self.assertEqual(provider.chat([{"role": "user", "content": "hi"}]), "恢复后的回复")
+        self.assertEqual(completions.calls, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_provider_reports_invalid_structured_response(self):
+        completions = CompletionSequence(["not-json"])
+        provider = ChatProvider.__new__(ChatProvider)
+        provider.model = "fake"
+        provider.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+        with self.assertRaisesRegex(ProviderResponseError, "不是有效 JSON"):
+            provider.json([{"role": "user", "content": "summarize"}])
+
     def test_chat_prompt_has_no_forced_question_or_round_limit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -58,6 +101,7 @@ class DiaryTests(unittest.TestCase):
             system = provider.last_chat_messages[0]["content"]
             self.assertIn("不要为了\n延长对话而硬问问题", system)
             self.assertNotIn("6 至 10 轮", system)
+            self.assertIn("不能直接读取或修改 Todo 数据库", system)
 
     def test_service_persists_chat_and_writes_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -104,6 +148,77 @@ class DiaryTests(unittest.TestCase):
             hits = memory.search("那个项目最近怎么样", top_k=1)
             self.assertEqual(memory.mode, "hybrid")
             self.assertIn("日记应用", hits[0].content)
+
+    def test_existing_long_term_memories_gain_vectors_only_during_backfill(self):
+        class SemanticEmbedder:
+            signature = "fake:backfill-v1"
+
+            def embed(self, texts):
+                return [
+                    [1.0, 0.0] if ("晨跑" in text or "exercise" in text)
+                    else [0.0, 1.0]
+                    for text in texts
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DiaryStore(Path(tmp) / "diary.sqlite")
+            LongTermMemory(store).remember([
+                {"content": "用户过去保持沿江晨跑", "category": "routine"},
+                {"content": "用户喜欢在家做饭", "category": "preference"},
+            ], "2026-09-01")
+            memory = LongTermMemory(store, SemanticEmbedder())
+            self.assertEqual(memory.mode, "keyword")
+            self.assertEqual(memory.search("exercise habits", 5), [])
+            result = memory.backfill_embeddings(batch_size=1, max_batches=10)
+            self.assertEqual(result["processed_embeddings"], 2)
+            self.assertEqual(result["pending_embeddings"], 0)
+            self.assertEqual(memory.mode, "hybrid")
+            hits = memory.search("exercise habits", 5)
+            self.assertEqual(len(hits), 1)
+            self.assertIn("晨跑", hits[0].content)
+
+    def test_chat_embeds_recall_query_once_for_both_memory_layers(self):
+        class CountingEmbedder:
+            signature = "fake:shared-query-v1"
+
+            def __init__(self):
+                self.calls = []
+
+            def embed(self, texts):
+                self.calls.append(list(texts))
+                return [[1.0, 0.0] for _ in texts]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = DiaryStore(root / "diary.sqlite")
+            embedder = CountingEmbedder()
+            memory = LongTermMemory(store, embedder)
+            memory.remember([{
+                "content": "用户在开发日记项目", "category": "project"
+            }], "2026-09-01")
+            settings = Settings(
+                root, "Daily", root / "diary.sqlite", ZoneInfo("UTC"),
+                "fake", "fake", "", "", "小叶",
+            )
+            service = DiaryService(
+                settings, provider=FakeProvider(), store=store, memory=memory
+            )
+            with store._lock, store.connection:
+                document = store.connection.execute(
+                    "INSERT INTO historical_documents(source_file, diary_date, "
+                    "raw_content, content_hash, extraction_status) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("/tmp/old.md", "2020-01-01", "旧日记内容", "hash", "disabled"),
+                )
+                store.connection.execute(
+                    "INSERT INTO historical_chunks(document_id, chunk_index, content, "
+                    "embedding, embedding_signature) VALUES (?, ?, ?, ?, ?)",
+                    (document.lastrowid, 0, "旧日记里的项目记录", "[1.0, 0.0]",
+                     embedder.signature),
+                )
+            embedder.calls.clear()
+            service.reply("How has that work been going?")
+            self.assertEqual(embedder.calls, [["How has that work been going?"]])
 
     def test_deleting_message_invalidates_only_that_days_memory_source(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -212,6 +327,51 @@ class DiaryTests(unittest.TestCase):
                 self.assertEqual(client.post(
                     "/v1/history/extract", json={"max_batches": 1}
                 ).status_code, 409)
+
+    def test_history_embed_api_backfills_both_memory_layers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = DiaryStore(root / "diary.sqlite")
+            LongTermMemory(store).remember([{
+                "content": "用户正在整理旧项目", "category": "project"
+            }], "2020-01-01")
+            memory = LongTermMemory(store, FakeEmbedder())
+            settings = Settings(
+                root, "Daily", root / "diary.sqlite", ZoneInfo("UTC"),
+                "fake", "fake", "", "", "小叶",
+            )
+            service = DiaryService(
+                settings, provider=FakeProvider(), store=store, memory=memory
+            )
+            with store._lock, store.connection:
+                document = store.connection.execute(
+                    "INSERT INTO historical_documents(source_file, diary_date, "
+                    "raw_content, content_hash, extraction_status) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("/tmp/history.md", "2020-01-01", "旧项目", "hash", "disabled"),
+                )
+                chunk = store.connection.execute(
+                    "INSERT INTO historical_chunks(document_id, chunk_index, content) "
+                    "VALUES (?, ?, ?)",
+                    (document.lastrowid, 0, "旧项目的原文片段"),
+                )
+                store.connection.execute(
+                    "INSERT INTO historical_chunk_fts(chunk_id, content) VALUES (?, ?)",
+                    (chunk.lastrowid, "旧项目的原文片段"),
+                )
+            with TestClient(create_app(service)) as client:
+                response = client.post(
+                    "/v1/history/embed",
+                    json={"batch_size": 1, "max_batches": 1},
+                )
+            self.assertEqual(response.status_code, 200)
+            result = response.json()
+            self.assertEqual(
+                result["historical_chunks"]["pending_embeddings"], 0
+            )
+            self.assertEqual(
+                result["long_term_memories"]["pending_embeddings"], 0
+            )
 
 
 if __name__ == "__main__":
