@@ -128,6 +128,7 @@ class LongTermMemory:
     def vector_enabled(self) -> bool:
         return bool(
             self.embedder and self.configured_search_mode in {"hybrid", "vector"}
+            and getattr(self.embedder, "runtime_state", None) != "error"
         )
 
     @staticmethod
@@ -195,6 +196,16 @@ class LongTermMemory:
         terms.extend(re.findall(r"[A-Za-z0-9_-]{3,}", query))
         unique = list(dict.fromkeys(terms))[:48]
         return " OR ".join(f'"{term}"' for term in unique) if unique else None
+
+    @staticmethod
+    def _fusion_weights(query: str, embedder) -> tuple[float, float]:
+        """Protect exact CJK matches when the selected encoder is English-only."""
+        contains_cjk = bool(re.search(
+            r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", query
+        ))
+        if contains_cjk and getattr(embedder, "supports_cjk", True) is False:
+            return 0.8, 0.2
+        return 0.4, 0.6
 
     def remember(self, items: list[dict], day: str) -> int:
         cleaned = []
@@ -443,6 +454,8 @@ class LongTermMemory:
 
     def status(self) -> dict:
         signature = self.embedder.signature if self.embedder else None
+        runtime_state = getattr(self.embedder, "runtime_state", None)
+        runtime_error = getattr(self.embedder, "runtime_error", None)
         with self.store._lock:
             total = int(self.store.connection.execute(
                 "SELECT COUNT(*) FROM memories"
@@ -463,6 +476,8 @@ class LongTermMemory:
         if self.configured_search_mode != "keyword":
             if not self.embedder:
                 fallback_reason = "embedding_not_configured"
+            elif runtime_state == "error":
+                fallback_reason = "embedding_runtime_error"
             elif total and not embedded:
                 fallback_reason = "embeddings_not_built"
         return {
@@ -474,6 +489,11 @@ class LongTermMemory:
             "embedding_provider": getattr(self.embedder, "provider", None),
             "embedding_model": getattr(self.embedder, "model", None),
             "embedding_signature": signature,
+            "embedding_runtime_state": runtime_state,
+            "embedding_runtime_error": runtime_error,
+            "embedding_model_cached": getattr(
+                self.embedder, "model_cached", None
+            ),
             "vector_min_similarity": self.vector_min_similarity,
             "fallback_reason": fallback_reason,
         }
@@ -520,11 +540,15 @@ class LongTermMemory:
                 )
 
         fused: dict[int, dict] = {}
-        candidate_groups = []
-        if mode != "vector":
-            candidate_groups.append((0.4, lexical))
-        if mode != "keyword":
-            candidate_groups.append((0.6, vector))
+        lexical_weight, vector_weight = self._fusion_weights(query, self.embedder)
+        if mode == "keyword":
+            candidate_groups = [(1.0, lexical)]
+        elif mode == "vector":
+            candidate_groups = [(1.0, vector)]
+        else:
+            candidate_groups = [
+                (lexical_weight, lexical), (vector_weight, vector)
+            ]
         for weight, candidates in candidate_groups:
             for rank, item in enumerate(candidates, 1):
                 entry = fused.setdefault(item["id"], dict(item, score=0.0))

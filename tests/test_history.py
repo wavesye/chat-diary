@@ -7,7 +7,9 @@ from unittest.mock import patch
 from diary_agent.activities import ActivityService
 from diary_agent.config import Settings
 from diary_agent.history import HistoricalMemoryIndex, ObsidianHistoryImporter
+from diary_agent.local_embeddings import LocalONNXEmbeddingProvider
 from diary_agent.memory import EmbeddingProvider, LongTermMemory
+from diary_agent.service import DiaryService
 from diary_agent.store import DiaryStore
 
 
@@ -32,6 +34,24 @@ class CountingSemanticEmbedder:
                 vectors.append([1.0, 0.0])
             else:
                 vectors.append([0.0, 1.0])
+        return vectors
+
+
+class EnglishOnlyConflictingEmbedder:
+    """Make the vector result intentionally disagree with the CJK lexical hit."""
+
+    signature = "local:english-only-conflict-v1"
+    supports_cjk = False
+
+    def embed(self, texts):
+        vectors = []
+        for text in texts:
+            if text.strip() == "论文第二节":
+                vectors.append([1.0, 0.0])
+            elif "论文第二节" in text:
+                vectors.append([0.0, 1.0])
+            else:
+                vectors.append([1.0, 0.0])
         return vectors
 
 
@@ -237,6 +257,43 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertIn("沿江晨跑", hits[0].content)
 
+    def test_cjk_lexical_hit_is_not_displaced_by_english_only_vector_result(self):
+        embedder = EnglishOnlyConflictingEmbedder()
+        memory = LongTermMemory(self.store, embedder, search_mode="hybrid")
+        memory.remember([
+            {
+                "content": "今天完成了论文第二节的修改",
+                "category": "project",
+                "importance": 1.0,
+            },
+            {
+                "content": "Went grocery shopping after work",
+                "category": "routine",
+                "importance": 1.0,
+            },
+        ], "2026-09-12")
+
+        memory_hits = memory.search("论文第二节", top_k=1)
+        self.assertEqual(len(memory_hits), 1)
+        self.assertIn("论文第二节", memory_hits[0].content)
+
+        (self.vault / "2020-02-05.md").write_text(
+            "今天完成了论文第二节的修改。", encoding="utf-8"
+        )
+        (self.vault / "2020-02-06.md").write_text(
+            "Went grocery shopping after work.", encoding="utf-8"
+        )
+        history_index = HistoricalMemoryIndex(
+            self.store, embedder, search_mode="hybrid"
+        )
+        ObsidianHistoryImporter(
+            history_index, LongTermMemory(self.store), self.activities, self.vault
+        ).scan()
+
+        history_hits = history_index.search("论文第二节", top_k=1)
+        self.assertEqual(len(history_hits), 1)
+        self.assertIn("论文第二节", history_hits[0].content)
+
     def test_corrupt_vector_is_skipped_without_disabling_other_vector_hits(self):
         rows = [
             {"id": 1, "embedding": "not-json", "content": "损坏数据"},
@@ -275,8 +332,147 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(after["pending_embeddings"], 0)
         self.assertEqual(after["embedding_signature"], CountingSemanticEmbedder.signature)
 
+    def test_embedding_runtime_error_forces_both_indexes_to_keyword_status(self):
+        class ReadyEmbedder:
+            signature = "local:runtime-status-v1"
+            runtime_state = "ready"
+
+            def embed(self, texts):
+                return [[1.0, 0.0] for _ in texts]
+
+        class FailedEmbedder:
+            signature = ReadyEmbedder.signature
+            runtime_state = "error"
+            runtime_error = "ONNX model could not be loaded"
+            provider = "local"
+            model = "all-MiniLM-L6-v2"
+
+            def embed(self, texts):
+                raise AssertionError("an errored runtime must never be queried")
+
+        ready = ReadyEmbedder()
+        LongTermMemory(self.store, ready).remember([{
+            "content": "用户正在修改论文第二节",
+            "category": "project",
+        }], "2026-09-12")
+        (self.vault / "2020-03-02.md").write_text(
+            "那天整理了论文笔记。", encoding="utf-8"
+        )
+        ready_history = HistoricalMemoryIndex(self.store, ready)
+        ObsidianHistoryImporter(
+            ready_history, LongTermMemory(self.store), self.activities, self.vault
+        ).scan()
+
+        failed = FailedEmbedder()
+        memory_status = LongTermMemory(self.store, failed).status()
+        history_status = HistoricalMemoryIndex(self.store, failed).status()
+
+        self.assertEqual(memory_status["embedded_memories"], 1)
+        self.assertEqual(memory_status["search_mode"], "keyword")
+        self.assertEqual(
+            memory_status["fallback_reason"], "embedding_runtime_error"
+        )
+        self.assertEqual(
+            memory_status["embedding_runtime_error"], failed.runtime_error
+        )
+        self.assertEqual(history_status["embedded_chunks"], 1)
+        self.assertEqual(history_status["search_mode"], "keyword")
+        self.assertEqual(
+            history_status["fallback_reason"], "embedding_runtime_error"
+        )
+        self.assertEqual(
+            history_status["embedding_runtime_error"], failed.runtime_error
+        )
+
 
 class ConfigTests(unittest.TestCase):
+    def test_local_onnx_is_the_zero_config_embedding_default(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(environ, {
+            "OBSIDIAN_VAULT_PATH": tmp,
+            "DIARY_DB_PATH": str(Path(tmp) / "diary.sqlite"),
+            "LLM_PROVIDER": "ollama",
+            "OLLAMA_MODEL": "chat-model",
+        }, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.embedding_provider, "local")
+        self.assertEqual(settings.embedding_model, "all-MiniLM-L6-v2")
+        self.assertEqual(settings.embedding_base_url, "")
+        self.assertEqual(settings.embedding_api_key, "")
+        self.assertEqual(settings.memory_search_mode, "hybrid")
+
+        with tempfile.TemporaryDirectory() as database_tmp, patch.object(
+            LocalONNXEmbeddingProvider, "_ensure_model_files",
+            side_effect=AssertionError("service status must not download the model"),
+        ) as ensure_files:
+            service = DiaryService(
+                settings, provider=object(), store=DiaryStore(
+                    Path(database_tmp) / "diary.sqlite"
+                )
+            )
+            service.memory.status()
+            service.history_index.status()
+        ensure_files.assert_not_called()
+        self.assertEqual(service.embedder.runtime_state, "not_loaded")
+
+    def test_legacy_remote_embedding_variables_still_select_openai_compatible(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(environ, {
+            "OBSIDIAN_VAULT_PATH": tmp,
+            "LLM_PROVIDER": "ollama",
+            "OLLAMA_MODEL": "chat-model",
+            "EMBEDDING_BASE_URL": "https://embedding.example/v1",
+            "EMBEDDING_API_KEY": "legacy-key",
+            "EMBEDDING_MODEL": "legacy-model",
+        }, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.embedding_provider, "openai-compatible")
+        self.assertEqual(settings.embedding_base_url, "https://embedding.example/v1")
+        self.assertEqual(settings.embedding_api_key, "legacy-key")
+        self.assertEqual(settings.embedding_model, "legacy-model")
+
+    def test_embedding_provider_none_explicitly_disables_the_new_local_default(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(environ, {
+            "OBSIDIAN_VAULT_PATH": tmp,
+            "LLM_PROVIDER": "ollama",
+            "OLLAMA_MODEL": "chat-model",
+            "EMBEDDING_PROVIDER": "none",
+            # Explicit none must win even if stale remote values remain in .env.
+            "EMBEDDING_BASE_URL": "https://embedding.example/v1",
+            "EMBEDDING_API_KEY": "stale-key",
+            "EMBEDDING_MODEL": "stale-model",
+        }, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.embedding_provider, "none")
+        self.assertEqual(settings.embedding_base_url, "")
+        self.assertEqual(settings.embedding_api_key, "")
+        self.assertEqual(settings.embedding_model, "")
+        with tempfile.TemporaryDirectory() as database_tmp:
+            service = DiaryService(settings, provider=object(), store=DiaryStore(
+                Path(database_tmp) / "none.sqlite"
+            ))
+            self.assertIsNone(service.embedder)
+            self.assertEqual(service.memory.mode, "keyword")
+
+    def test_keyword_mode_keeps_local_default_but_never_enables_vector_search(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(environ, {
+            "OBSIDIAN_VAULT_PATH": tmp,
+            "LLM_PROVIDER": "ollama",
+            "OLLAMA_MODEL": "chat-model",
+            "MEMORY_SEARCH_MODE": "keyword",
+        }, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.embedding_provider, "local")
+        self.assertEqual(settings.memory_search_mode, "keyword")
+        with tempfile.TemporaryDirectory() as database_tmp, patch.object(
+            LocalONNXEmbeddingProvider, "_ensure_model_files",
+            side_effect=AssertionError("keyword mode must not load the model"),
+        ) as ensure_files:
+            service = DiaryService(settings, provider=object(), store=DiaryStore(
+                Path(database_tmp) / "keyword.sqlite"
+            ))
+            self.assertFalse(service.memory.vector_enabled)
+            self.assertEqual(service.memory.search("anything"), [])
+        ensure_files.assert_not_called()
+
     def test_openai_compatible_signature_keeps_existing_vectors_usable(self):
         embedder = EmbeddingProvider(
             base_url="https://embedding.example/v1",
@@ -320,6 +516,55 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.embedding_base_url, "http://127.0.0.1:11434/v1")
         self.assertEqual(settings.embedding_api_key, "ollama")
         self.assertEqual(settings.embedding_model, "embeddinggemma")
+
+
+class LocalONNXEmbeddingProviderTests(unittest.TestCase):
+    def test_empty_input_does_not_load_or_download_the_model(self):
+        provider = LocalONNXEmbeddingProvider()
+        with patch.object(
+            provider, "_ensure_model_files",
+            side_effect=AssertionError("empty input must not touch model files"),
+        ):
+            self.assertEqual(provider.embed([]), [])
+        self.assertEqual(provider.runtime_state, "not_loaded")
+
+    def test_runtime_is_loaded_lazily_and_reused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = LocalONNXEmbeddingProvider(cache_dir=Path(tmp))
+            tokenizer = object()
+            session = object()
+            model_dir = Path(tmp) / "model"
+            with patch.object(
+                provider, "_ensure_model_files", return_value=model_dir
+            ) as ensure_files:
+                with patch.object(
+                    provider, "_load_runtime", return_value=(tokenizer, session)
+                ) as load_runtime:
+                    self.assertEqual(provider.runtime_state, "not_loaded")
+                    self.assertEqual(
+                        provider._ensure_runtime(), (tokenizer, session)
+                    )
+                    self.assertEqual(
+                        provider._ensure_runtime(), (tokenizer, session)
+                    )
+        ensure_files.assert_called_once_with()
+        load_runtime.assert_called_once_with(model_dir)
+        self.assertEqual(provider.runtime_state, "ready")
+        self.assertIsNone(provider.runtime_error)
+
+    def test_failed_first_load_is_reported_and_not_retried_for_every_chunk(self):
+        provider = LocalONNXEmbeddingProvider()
+        with patch.object(
+            provider, "_ensure_model_files",
+            side_effect=RuntimeError("model download unavailable"),
+        ) as ensure_files:
+            with self.assertRaisesRegex(RuntimeError, "model download unavailable"):
+                provider._ensure_runtime()
+            with self.assertRaisesRegex(RuntimeError, "model download unavailable"):
+                provider._ensure_runtime()
+        ensure_files.assert_called_once_with()
+        self.assertEqual(provider.runtime_state, "error")
+        self.assertIn("model download unavailable", provider.runtime_error)
 
 
 if __name__ == "__main__":

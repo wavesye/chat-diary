@@ -7,6 +7,7 @@ from datetime import datetime
 from .config import Settings
 from .activities import ActivityService
 from .history import HistoricalMemoryIndex, ObsidianHistoryImporter
+from .local_embeddings import LocalONNXEmbeddingProvider
 from .memory import EmbeddingProvider, LongTermMemory
 from .prompts import CHAT_SYSTEM, SUMMARY_PROMPT, SUMMARY_SYSTEM
 from .provider import ChatProvider
@@ -27,7 +28,15 @@ class DiaryService:
         if memory is not None:
             self.memory = memory
         else:
-            if settings.embedding_model:
+            if settings.embedding_provider == "local":
+                embedder = LocalONNXEmbeddingProvider(
+                    cache_dir=settings.local_embedding_cache_dir,
+                    threads=settings.local_embedding_threads,
+                )
+            elif (
+                settings.embedding_provider in {"ollama", "openai-compatible"}
+                and settings.embedding_model
+            ):
                 embedder = EmbeddingProvider(
                     base_url=settings.embedding_base_url,
                     api_key=settings.embedding_api_key,

@@ -43,6 +43,8 @@ class Settings:
     embedding_provider: str = ""
     memory_search_mode: str = "hybrid"
     memory_vector_min_similarity: float = 0.1
+    local_embedding_cache_dir: Path | None = None
+    local_embedding_threads: int = 2
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -105,16 +107,33 @@ class Settings:
         generic_embedding_configured = any(os.getenv(name, "").strip() for name in (
             "EMBEDDING_BASE_URL", "EMBEDDING_API_KEY", "EMBEDDING_MODEL",
         ))
-        if not embedding_provider and generic_embedding_configured:
-            # Backwards compatibility with the original three-variable setup.
-            embedding_provider = "openai-compatible"
+        if not embedding_provider:
+            # Keep existing .env files working, but make a zero-config install use
+            # the in-process ONNX model rather than an external embedding service.
+            embedding_provider = (
+                "openai-compatible" if generic_embedding_configured else "local"
+            )
         if embedding_provider in {"openai", "compatible"}:
             embedding_provider = "openai-compatible"
-        if embedding_provider not in {"", "ollama", "openai-compatible"}:
+        if embedding_provider in {"local-onnx", "onnx"}:
+            embedding_provider = "local"
+        if embedding_provider in {"disabled", "off"}:
+            embedding_provider = "none"
+        if embedding_provider not in {
+            "local", "none", "ollama", "openai-compatible",
+        }:
             raise ValueError(
-                "EMBEDDING_PROVIDER 只能是 ollama 或 openai-compatible"
+                "EMBEDDING_PROVIDER 只能是 local、none、ollama 或 openai-compatible"
             )
-        if embedding_provider == "ollama":
+        if embedding_provider == "local":
+            embedding_base_url = ""
+            embedding_api_key = ""
+            embedding_model = "all-MiniLM-L6-v2"
+        elif embedding_provider == "none":
+            embedding_base_url = ""
+            embedding_api_key = ""
+            embedding_model = ""
+        elif embedding_provider == "ollama":
             embedding_base_url = (
                 os.getenv("OLLAMA_EMBEDDING_BASE_URL", "").strip()
                 or "http://127.0.0.1:11434/v1"
@@ -128,10 +147,25 @@ class Settings:
             embedding_base_url = os.getenv("EMBEDDING_BASE_URL", "").strip().rstrip("/")
             embedding_api_key = os.getenv("EMBEDDING_API_KEY", "").strip()
             embedding_model = os.getenv("EMBEDDING_MODEL", "").strip()
-        if embedding_model and not embedding_base_url:
+        if (
+            embedding_provider == "openai-compatible"
+            and embedding_model
+            and not embedding_base_url
+        ):
             raise ValueError("设置 EMBEDDING_MODEL 后还需要 EMBEDDING_BASE_URL")
-        if embedding_model and not embedding_api_key and embedding_provider != "ollama":
+        if (
+            embedding_provider == "openai-compatible"
+            and embedding_model
+            and not embedding_api_key
+        ):
             raise ValueError("设置 EMBEDDING_MODEL 后还需要 EMBEDDING_API_KEY")
+        cache_value = os.getenv("LOCAL_EMBEDDING_CACHE_DIR", "").strip()
+        try:
+            local_embedding_threads = int(os.getenv("LOCAL_EMBEDDING_THREADS", "2"))
+        except ValueError:
+            raise ValueError("LOCAL_EMBEDDING_THREADS 必须是 1 到 32 之间的整数") from None
+        if not 1 <= local_embedding_threads <= 32:
+            raise ValueError("LOCAL_EMBEDDING_THREADS 必须是 1 到 32 之间的整数")
         return cls(
             vault_path=Path(vault).expanduser().resolve(),
             journal_folder=os.getenv("OBSIDIAN_JOURNAL_FOLDER", "日记/AI 日记"),
@@ -148,6 +182,10 @@ class Settings:
             embedding_provider=embedding_provider,
             memory_search_mode=search_mode,
             memory_vector_min_similarity=vector_min_similarity,
+            local_embedding_cache_dir=(
+                Path(cache_value).expanduser() if cache_value else None
+            ),
+            local_embedding_threads=local_embedding_threads,
             memory_top_k=max(1, min(int(os.getenv("MEMORY_TOP_K", "5")), 10)),
             todo_reminders_enabled=os.getenv("TODO_REMINDERS_ENABLED", "true").lower()
             not in {"0", "false", "no", "off"},

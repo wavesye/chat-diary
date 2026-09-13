@@ -1,0 +1,9 @@
+{
+  "channels": {
+    "telegram": {"enabled": true},
+    "wechat": {"enabled": false},
+    "qq": {"enabled": false},
+    "line": {"enabled": false},
+    "whatsapp": {"enabled": false}
+  }
+}

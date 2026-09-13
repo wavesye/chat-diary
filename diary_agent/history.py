@@ -92,6 +92,7 @@ class HistoricalMemoryIndex:
     def vector_enabled(self) -> bool:
         return bool(
             self.embedder and self.configured_search_mode in {"hybrid", "vector"}
+            and getattr(self.embedder, "runtime_state", None) != "error"
         )
 
     def backfill_embeddings(self, batch_size: int = 32,
@@ -172,11 +173,17 @@ class HistoricalMemoryIndex:
                     error,
                 )
         fused = {}
-        candidate_groups = []
-        if mode != "vector":
-            candidate_groups.append((0.4, lexical))
-        if mode != "keyword":
-            candidate_groups.append((0.6, vector))
+        lexical_weight, vector_weight = LongTermMemory._fusion_weights(
+            query, self.embedder
+        )
+        if mode == "keyword":
+            candidate_groups = [(1.0, lexical)]
+        elif mode == "vector":
+            candidate_groups = [(1.0, vector)]
+        else:
+            candidate_groups = [
+                (lexical_weight, lexical), (vector_weight, vector)
+            ]
         for weight, candidates in candidate_groups:
             for rank, item in enumerate(candidates, 1):
                 fused.setdefault(item["id"], dict(item, score=0.0))["score"] += weight / (60 + rank)
@@ -188,6 +195,8 @@ class HistoricalMemoryIndex:
 
     def status(self) -> dict:
         signature = self.embedder.signature if self.embedder else None
+        runtime_state = getattr(self.embedder, "runtime_state", None)
+        runtime_error = getattr(self.embedder, "runtime_error", None)
         with self.store._lock:
             documents = self.store.connection.execute(
                 "SELECT COUNT(*) FROM historical_documents"
@@ -213,6 +222,8 @@ class HistoricalMemoryIndex:
         if self.configured_search_mode != "keyword":
             if not self.embedder:
                 fallback_reason = "embedding_not_configured"
+            elif runtime_state == "error":
+                fallback_reason = "embedding_runtime_error"
             elif chunks and not embedded:
                 fallback_reason = "embeddings_not_built"
         return {
@@ -226,6 +237,11 @@ class HistoricalMemoryIndex:
             "embedding_provider": getattr(self.embedder, "provider", None),
             "embedding_model": getattr(self.embedder, "model", None),
             "embedding_signature": signature,
+            "embedding_runtime_state": runtime_state,
+            "embedding_runtime_error": runtime_error,
+            "embedding_model_cached": getattr(
+                self.embedder, "model_cached", None
+            ),
             "vector_min_similarity": self.vector_min_similarity,
             "fallback_reason": fallback_reason,
         }
@@ -318,6 +334,11 @@ class ObsidianHistoryImporter:
             raise ValueError(f"历史日记目录不存在：{self.root}")
         result = {"imported": 0, "updated": 0, "unchanged": 0, "skipped": 0, "errors": []}
         for path in sorted(self.root.rglob("*.md")):
+            # User-owned vaults are separate namespaces, even when a local
+            # owner's history root contains their parent directory.
+            if any((parent / ".chat-diary-user").is_file()
+                   for parent in path.resolve().parents):
+                continue
             if any(part.startswith(".") for part in path.relative_to(self.root).parts):
                 continue
             try:
