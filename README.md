@@ -322,8 +322,15 @@ Telegram commands:
 - `/todo cancel 3` — cancel a todo while retaining its event history.
 - `/today` — show today's todos, including overdue unfinished items.
 - `/week` — show todos planned for the next seven days.
-- `/preview` — preview today's journal entry.
-- `/done` — write today's Markdown journal entry.
+- `/calendar` — review the last 30 days, seven days per page; use buttons or `/calendar recent 2`.
+- `/calendar 2026-08` — review a month; `/calendar 2026-08-20` shows one day's activities and completed todos.
+- `/quote Original text` — preserve the exact text, including whitespace and line breaks.
+- `/quote last` — preserve the previous user message; `/quote list` lists selections, `/quote remove ID` removes one.
+- `/preview` — create a persistent draft, or return the existing draft unchanged.
+- `/edit` — replace the draft with the complete Markdown in your next message; `/edit Full Markdown` also works.
+- `/edit cancel` — leave edit mode without changing the draft.
+- `/preview refresh` — regenerate from current records, replacing the draft and any manual edits.
+- `/done` — write the current draft to Obsidian verbatim; generate once if no draft exists.
 - `/memory` — list long-term memories.
 - `/status` — show the debounce window and effective memory/search modes loaded by the bot.
 
@@ -332,6 +339,17 @@ typing indicator never interrupts the conversation or journal generation. If ret
 exhausted, the bot distinguishes model, Telegram, and file-system failures instead of returning
 an empty generic error. After a reported processing failure, resend the message to retry;
 the whole business workflow is not automatically retried indefinitely.
+
+Journal entries include confirmed unfinished todos created, confirmed, adjusted or scheduled for
+the day as `- [ ]`, and todos completed that day as `- [x]`. Pending and cancelled tasks are
+excluded. Titles use concrete, natural wording. Explicitly selected quotes are stored separately
+and inserted without model rewriting. Chinese requests such as “这段话要原封不动放到日记里” select
+the previous user message; append a colon and the original text to specify a new passage.
+
+The Web preview also supports editing and saving the full Markdown. Drafts survive restarts.
+New conversations, todos and quotes never silently overwrite a preview: use `/preview refresh`
+to regenerate, or edit manually. Manually edited entries do not retain model-extracted memories
+from the original draft. In the CLI's multiline `/edit` mode, press Esc then Enter to submit.
 
 Natural-language examples:
 
@@ -452,7 +470,7 @@ to run while first-layer local retrieval remains available.
 
 Main endpoints:
 
-- Journal: `GET /v1/session`, `POST /v1/chat`, `POST /v1/preview`, `POST /v1/finalize`, and
+- Journal: `GET /v1/session`, `POST /v1/chat`, `POST/PUT /v1/preview`, `POST /v1/finalize`, and
   `DELETE /v1/messages/{id}`.
 - Todos: `GET/POST /v1/todos`, `PATCH/DELETE /v1/todos/{id}`, and
   `POST /v1/todos/{id}/confirm|complete|postpone|cancel`.
@@ -472,7 +490,7 @@ Telegram offset on migration, then saves channel state, pending Telegram updates
 receipts in the binding database. Pending updates can contain message text; include this
 database in diary backups. Existing diary records stay with the internal local owner.
 
-New tables include `todos`, `todo_events`, `activities`, `reminder_log`, `historical_documents`,
+New tables include `todos`, `todo_events`, `activities`, `reminder_log`, `diary_drafts`, `verbatim_quotes`, `historical_documents`,
 `historical_chunks`, `historical_chunk_fts`, and `historical_memory_evidence`. Back up
 `data/diary.sqlite` before the first upgrade.
 

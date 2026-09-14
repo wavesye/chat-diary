@@ -304,8 +304,15 @@ Telegram 命令：
 - `/todo 取消 3`：取消任务，保留操作记录。
 - `/today`：当天 Todo，包含过期未完成项。
 - `/week`：未来七天 Todo。
-- `/preview`：预览当天日记。
-- `/done`：写入 Markdown 日记。
+- `/calendar`：回顾最近 30 天，每页 7 天；按钮或 `/calendar recent 2` 翻页。
+- `/calendar 2026-08`：按月回顾；`/calendar 2026-08-20` 查看一天的活动和完成的 Todo。
+- `/quote 原文`：指定一段原话，保留文字、空格和换行。
+- `/quote last`：保留上一条用户消息；`/quote list` 查看已指定的原话；`/quote remove ID` 移除。
+- `/preview`：生成并保存当天草稿，再次使用会返回同一份。
+- `/edit`：将下一条消息的完整 Markdown 保存为草稿；也可直接发送 `/edit 完整Markdown`。
+- `/edit cancel`：退出编辑模式，保留现有草稿。
+- `/preview refresh`：根据最新记录重新生成，替换现有草稿（包括手动修改）。
+- `/done`：按当前草稿原样写入 Obsidian；没有草稿时先生成一次。
 - `/memory`：查看长期记忆。
 - `/status`：查看 Bot 实际加载的消息合并秒数和记忆检索模式。
 
@@ -322,6 +329,16 @@ Telegram 短暂断线和模型服务的临时超时会自动重试；“正在�
 - “论文已经改完了”——完成匹配的 Todo；没有匹配项时记为当天已完成活动。
 - “BMS 分析挪到后天”——匹配并延期。
 - “我希望有空学陶艺”——属于模糊愿望，Bot 先显示“确认加入/取消”按钮。
+- “这段话要原封不动放到日记里”——保留上一条用户消息；也可以说“这段话要原封不动放到日记里：原文”。
+
+最终日记会带上当天新增、确认、调整或应做的未完成 Todo（`- [ ]`）和当天完成的 Todo
+（`- [x]`）。待确认、已取消任务不会混入清单。标题采用具体、自然的日常表达，避免强行
+营造意象。用户指定的原话独立保存并直接插入日记，不交给模型改写。
+
+Web 预览也支持编辑完整 Markdown、保存草稿和按原文写入。草稿保存在本地数据库中，
+重启后仍可继续编辑。预览后新增聊天、Todo 或原话不会自动覆盖草稿；需要纳入时用
+`/preview refresh` 重新生成，或手动编辑。手动改动的日记不会沿用原草稿中可能已被删除的
+模型提取记忆。命令行 `/edit` 使用多行输入，按 Esc 后按 Enter 提交。
 
 中英文的创建、完成、延期、取消、相对日期、星期、英文月份和 `3pm` 等时间表达有本地
 规则兜底。其他语言会在聊天回复完成后交给独立的结构化模型判断，并要求模型逐字返回
@@ -420,7 +437,7 @@ python3 import_history.py extract --max-batches 20 --batch-size 5
 
 主要接口：
 
-- 日记：`GET /v1/session`、`POST /v1/chat`、`POST /v1/preview`、
+- 日记：`GET /v1/session`、`POST /v1/chat`、`POST/PUT /v1/preview`、
   `POST /v1/finalize`、`DELETE /v1/messages/{id}`。
 - Todo：`GET/POST /v1/todos`、`PATCH/DELETE /v1/todos/{id}`、
   `POST /v1/todos/{id}/confirm|complete|postpone|cancel`。
@@ -438,7 +455,7 @@ python3 import_history.py extract --max-batches 20 --batch-size 5
 保存到绑定库。待处理 updates 可能包含消息正文，请将绑定库一起纳入日记备份。
 原日记记录仍归属于内部的本地拥有者。
 
-新增表包括 `todos`、`todo_events`、`activities`、`reminder_log`、
+新增表包括 `todos`、`todo_events`、`activities`、`reminder_log`、`diary_drafts`、`verbatim_quotes`、
 `historical_documents`、`historical_chunks`、`historical_chunk_fts` 和
 `historical_memory_evidence`。首次升级前仍建议复制一份 `data/diary.sqlite` 作为备份。
 

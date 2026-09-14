@@ -23,6 +23,21 @@ class DiaryStore:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_messages_day ON messages(day, id);
+            CREATE TABLE IF NOT EXISTS verbatim_quotes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_message_id INTEGER,
+                FOREIGN KEY(source_message_id) REFERENCES messages(id) ON DELETE CASCADE,
+                UNIQUE(day, content)
+            );
+            CREATE TABLE IF NOT EXISTS diary_drafts (
+                day TEXT PRIMARY KEY,
+                markdown TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '{}',
+                source_fingerprint TEXT NOT NULL DEFAULT '',
+                edited INTEGER NOT NULL DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS entries (
                 day TEXT PRIMARY KEY,
                 markdown_path TEXT NOT NULL,
@@ -155,6 +170,49 @@ class DiaryStore:
                 "SELECT COUNT(*) AS n FROM messages WHERE day = ? AND role = 'user'", (day,)
             ).fetchone()
         return int(row["n"])
+
+    def add_quote(self, day: str, content: str, source_message_id: int | None = None) -> dict:
+        if not content.strip() or "\x00" in content:
+            raise ValueError("原话不能为空或包含空字符")
+        with self._lock, self.connection:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO verbatim_quotes(day, content, source_message_id) VALUES (?, ?, ?)",
+                (day, content, source_message_id),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM verbatim_quotes WHERE day=? AND content=?", (day, content)
+            ).fetchone()
+        return dict(row)
+
+    def quotes(self, day: str) -> list[dict]:
+        with self._lock:
+            return [dict(row) for row in self.connection.execute(
+                "SELECT * FROM verbatim_quotes WHERE day=? ORDER BY id", (day,)
+            ).fetchall()]
+
+    def delete_quote(self, day: str, quote_id: int) -> bool:
+        with self._lock, self.connection:
+            return bool(self.connection.execute(
+                "DELETE FROM verbatim_quotes WHERE day=? AND id=?", (day, quote_id)
+            ).rowcount)
+
+    def draft(self, day: str) -> dict | None:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM diary_drafts WHERE day=?", (day,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_draft(self, day: str, markdown: str, summary: str,
+                   source_fingerprint: str, *, edited: bool = False) -> None:
+        with self._lock, self.connection:
+            self.connection.execute(
+                "INSERT INTO diary_drafts(day, markdown, summary, source_fingerprint, edited) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(day) DO UPDATE SET "
+                "markdown=excluded.markdown, summary=excluded.summary, "
+                "source_fingerprint=excluded.source_fingerprint, edited=excluded.edited",
+                (day, markdown, summary, source_fingerprint, int(edited)),
+            )
 
     def mark_finalized(
         self, day: str, path: Path, *, title: str = "", tags: str = "[]"

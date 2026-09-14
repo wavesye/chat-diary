@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>拾光 · 对话日记</title>
   <link rel="stylesheet" href="/assets/styles.css?v=20260906-2">
-  <link rel="stylesheet" href="/assets/overrides.css?v=20260909-1">
+  <link rel="stylesheet" href="/assets/overrides.css?v=20260914-1">
 </head>
 <body>
   <div class="shell">
@@ -81,10 +81,22 @@
   <div class="overlay" id="overlay"></div>
   <aside class="preview" id="preview" aria-hidden="true">
     <header><div><span class="eyebrow">TODAY'S NOTE</span><h2>今日手记</h2></div><button id="closePreview" aria-label="关闭">×</button></header>
+    <div class="draft-toolbar">
+      <div class="draft-tabs" role="tablist" aria-label="草稿显示方式">
+        <button id="renderDraft" role="tab" aria-selected="true" aria-controls="paper">阅读预览</button>
+        <button id="editDraft" role="tab" aria-selected="false" aria-controls="draftEditor">编辑 Markdown</button>
+      </div>
+      <button class="secondary" id="refreshDraft">重新生成</button>
+    </div>
+    <p class="draft-status" id="draftStatus" role="status">生成后可以直接修改标题和正文。</p>
     <div class="paper" id="paper"><p class="paper-empty">聊过几句后，这里会出现一篇连贯的日记。</p></div>
-    <button class="primary wide" id="saveFromPreview">写入 Obsidian</button>
+    <textarea class="draft-editor" id="draftEditor" aria-label="日记 Markdown 草稿" spellcheck="false" hidden></textarea>
+    <div class="draft-actions">
+      <button class="secondary" id="saveDraft">保存草稿</button>
+      <button class="primary" id="saveFromPreview">写入 Obsidian</button>
+    </div>
   </aside>
   <div class="toast" id="toast" role="status"></div>
-  <script src="/assets/app.js?v=20260909-1"></script>
+  <script src="/assets/app.js?v=20260914-1"></script>
 </body>
 </html>

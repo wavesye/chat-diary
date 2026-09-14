@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone as datetime_timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -346,6 +346,74 @@ class TodoService:
         start = date.fromisoformat(day) if day else self.now.date()
         return self.list(start=start.isoformat(), end=(start + timedelta(days=6)).isoformat())
 
+    def diary_items(self, day: str) -> list[dict]:
+        """Return confirmed tasks relevant to a diary, using their current state.
+
+        Active tasks belong to their local creation/change day and any day they
+        are scheduled or overdue. Completed tasks belong only to their local
+        completion day, so old accomplishments do not repeat in later diaries.
+        Eventless older rows fall back to the timestamps stored on the task.
+        """
+        target = date.fromisoformat(day).isoformat()
+
+        def local_day(value: str | None, *, database_time: bool = False) -> str | None:
+            if not value:
+                return None
+            try:
+                if len(value) == 10:
+                    return date.fromisoformat(value).isoformat()
+                moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if moment.tzinfo is None:
+                    moment = moment.replace(
+                        tzinfo=datetime_timezone.utc if database_time else self.timezone
+                    )
+                return moment.astimezone(self.timezone).date().isoformat()
+            except (TypeError, ValueError):
+                return None
+
+        with self.store._lock:
+            rows = self.store.connection.execute(
+                "SELECT * FROM todos WHERE status IN ('active', 'completed') "
+                "ORDER BY priority DESC, id"
+            ).fetchall()
+            events = self.store.connection.execute(
+                "SELECT todo_id, action, created_at FROM todo_events WHERE action IN "
+                "('create', 'confirm', 'update', 'postpone', 'complete')"
+            ).fetchall()
+        changed_today: set[int] = set()
+        completed_today: set[int] = set()
+        for event in events:
+            if local_day(event["created_at"], database_time=True) != target:
+                continue
+            if event["action"] == "complete":
+                completed_today.add(event["todo_id"])
+            else:
+                changed_today.add(event["todo_id"])
+
+        result = []
+        for row in rows:
+            todo = dict(row)
+            if todo["status"] == "completed":
+                completion_day = local_day(todo.get("completed_at"))
+                if completion_day == target or (
+                    completion_day is None and todo["id"] in completed_today
+                ):
+                    result.append(todo)
+                continue
+            created_day = local_day(todo.get("created_at"), database_time=True)
+            if created_day and created_day > target:
+                continue
+            changed_day = local_day(todo.get("updated_at"), database_time=True)
+            planned_day = local_day(todo.get("planned_date"))
+            due_day = local_day(todo.get("due_at"))
+            if (
+                todo["id"] in changed_today or created_day == target or changed_day == target
+                or (planned_day is not None and planned_day <= target)
+                or (due_day is not None and due_day <= target)
+            ):
+                result.append(todo)
+        return result
+
     def confirm(self, todo_id: int) -> dict:
         todo = self._require(todo_id, "pending_confirmation")
         with self.store._lock, self.store.connection:
@@ -362,6 +430,8 @@ class TodoService:
     ) -> dict:
         todo = self._require(todo_id, "active")
         when = completed_at or self.now
+        when = (when.replace(tzinfo=self.timezone) if when.tzinfo is None
+                else when.astimezone(self.timezone))
         with self.store._lock, self.store.connection:
             self.store.connection.execute(
                 "UPDATE todos SET status='completed', completed_at=?, "

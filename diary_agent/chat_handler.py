@@ -11,16 +11,21 @@ import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
 from .channels.base import Button, ChannelAdapter, MessageProcessingError
+from .calendar_review import CalendarReview
 from .provider import ProviderResponseError
 from .service import DiaryService
 from .todo import TaskIntent, clean_task_title, parse_relative_date
+from .verbatim import command_parts, preservation_request
 
 HELP = (
     "直接发消息就可以开始记录。\n\n"
     "/todo — 查看或管理 Todo\n"
     "/today — 今天需要做什么\n"
     "/week — 未来七天的 Todo\n"
+    "/calendar — 回顾最近30天（每页7天）；可指定月份或日期\n"
     "/preview — 预览今天的日记\n"
+    "/edit — 编辑日记草稿；/edit cancel 取消编辑\n"
+    "/quote 原文 — 原封不动放进日记；/quote last 保留上一条消息\n"
     "/done — 写入 Obsidian\n"
     "/memory — 查看长期记忆\n"
     "/status — 查看 Bot 当前运行配置\n"
@@ -142,6 +147,10 @@ class ChatHandler:
     async def handle_action(self, data: str) -> None:
         chat_id = self.external_user_id
         try:
+            if data.startswith("calendar:"):
+                _, period, page = data.split(":")
+                await self._handle_calendar_command(chat_id, f"{period} {page}")
+                return
             prefix, action, raw_id = data.split(":", 2)
             if prefix != "todo":
                 raise ValueError("无法识别这个按钮")
@@ -175,6 +184,10 @@ class ChatHandler:
                 await self._send_todo(chat_id, todo)
         except Exception as error:
             await self._report_processing_error(chat_id, error)
+
+    async def _handle_calendar_command(self, chat_id: str, query: str) -> None:
+        text, buttons = CalendarReview(self.service.activities, self.service.day).render(query)
+        await self._send(chat_id, text, buttons=buttons)
 
     async def _handle_todo_command(self, chat_id: str, text: str) -> None:
         parts = text.split(maxsplit=2)
@@ -318,11 +331,26 @@ class ChatHandler:
 
     async def handle_texts(self, texts: list[str]) -> None:
         chat_id = self.external_user_id
-        texts = [text.strip() for text in texts if text.strip()]
+        texts = [text for text in texts if text.strip()]
         if not texts:
             return
         combined = "\n".join(texts)
         try:
+            if self.service.editing_draft:
+                # A transport may batch a pasted draft into multiple messages.
+                answer = self.service.journal_instruction(combined)
+                if answer is not None:
+                    await self._send(chat_id, answer)
+                    return
+            if any(command_parts(text)[0] in {"/edit", "/quote"}
+                   or preservation_request(text)[0] for text in texts):
+                for text in texts:
+                    answer = self.service.journal_instruction(text)
+                    if answer is not None:
+                        await self._send(chat_id, answer)
+                    else:
+                        await self.handle_texts([text])
+                return
             # A single, explicit task-management message does not need a second
             # conversational answer. Route it locally so only the database-backed
             # result is presented as authoritative.
@@ -359,11 +387,14 @@ class ChatHandler:
 
     async def handle_text(self, text: str) -> None:
         chat_id = self.external_user_id
-        text = text.strip()
-        if not text:
+        if not text.strip():
             return
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
         try:
+            answer = self.service.journal_instruction(text)
+            if answer is not None:
+                await self._send(chat_id, answer)
+                return
             if command in {"/start", "/help"}:
                 await self._send(chat_id, self.service.greeting() + "\n\n" + HELP)
                 return
@@ -376,15 +407,30 @@ class ChatHandler:
             if command == "/week":
                 await self._send_todo_list(chat_id, self.service.todos.week(), "未来七天的 Todo")
                 return
+            if command == "/calendar":
+                parts = text.split(maxsplit=1)
+                await self._handle_calendar_command(chat_id, parts[1] if len(parts) > 1 else "")
+                return
             if command == "/preview":
+                _, option = command_parts(text)
+                if option.strip() not in {"", "refresh"}:
+                    raise ValueError("用法：/preview 查看草稿；/preview refresh 重新生成并替换草稿")
                 await self._show_typing(chat_id)
-                preview = await asyncio.to_thread(self.service.preview)
+                preview = await asyncio.to_thread(self.service.preview, refresh=option.strip() == "refresh")
+                status = self.service.draft_status()
+                note = "草稿已保存。/edit 修改全文；/done 按此草稿写入；/preview refresh 重新生成并替换草稿。"
+                if status["stale"]:
+                    note += "\n预览后有新增或修改的记录，当前仍保留原草稿；需要纳入时请重新生成或手动编辑。"
+                await self._send(chat_id, note)
                 await self._send(chat_id, preview)
                 return
             if command == "/done":
                 await self._show_typing(chat_id)
                 path = await asyncio.to_thread(self.service.finalize)
-                await self._send(chat_id, f"今天的日记已写入 Obsidian：{Path(path).name}")
+                note = f"今天的日记已写入 Obsidian：{Path(path).name}（按草稿原文）"
+                if self.service.draft_status()["stale"]:
+                    note += "\n保存的是已有草稿；之后新增或修改的记录未自动合入。可 /preview refresh 重新生成，或 /edit 补充后再 /done。"
+                await self._send(chat_id, note)
                 return
             if command == "/memory":
                 memories = self.service.memory.list()

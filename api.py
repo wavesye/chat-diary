@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
@@ -11,6 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from diary_agent.config import Settings
+from diary_agent.chat_handler import ChatHandler
+from diary_agent.channels.base import ChannelAdapter
 from diary_agent.service import DiaryService
 
 
@@ -39,11 +42,18 @@ class SessionResponse(BaseModel):
 class PreviewResponse(BaseModel):
     day: str
     markdown: str
+    edited: bool = False
+    stale: bool = False
+
+
+class DraftEditRequest(BaseModel):
+    markdown: str = Field(min_length=1, max_length=200_000)
 
 
 class FinalizeResponse(BaseModel):
     day: str
     path: str
+    stale: bool = False
 
 
 class MemoryResponse(BaseModel):
@@ -82,6 +92,22 @@ class HistoryEmbedRequest(BaseModel):
     batch_size: int = Field(default=32, ge=1, le=256)
 
 
+class WebReplyAdapter(ChannelAdapter):
+    name = "web"
+
+    def __init__(self):
+        self.replies = []
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    async def send_message(self, user_id, text, *, buttons=()):
+        self.replies.append(text)
+
+
 def create_app(service: DiaryService | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -89,6 +115,7 @@ def create_app(service: DiaryService | None = None) -> FastAPI:
             app.state.diary = service
         else:
             app.state.diary = DiaryService(Settings.from_env())
+        app.state.chat_lock = asyncio.Lock()
         yield
 
     app = FastAPI(
@@ -114,11 +141,14 @@ def create_app(service: DiaryService | None = None) -> FastAPI:
         )
 
     @app.post("/v1/chat", response_model=ChatResponse)
-    def chat(
-        body: ChatRequest, diary: DiaryService = Depends(get_service)
+    async def chat(
+        body: ChatRequest, request: Request, diary: DiaryService = Depends(get_service)
     ) -> ChatResponse:
         try:
-            answer = diary.reply(body.message)
+            async with request.app.state.chat_lock:
+                adapter = WebReplyAdapter()
+                await ChatHandler(diary, adapter, "local", "local").handle_text(body.message)
+                answer = "\n\n".join(adapter.replies)
         except Exception as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         return ChatResponse(day=diary.day, reply=answer)
@@ -132,14 +162,24 @@ def create_app(service: DiaryService | None = None) -> FastAPI:
         return {"ok": True, "memories_need_rebuild": True}
 
     @app.post("/v1/preview", response_model=PreviewResponse)
-    def preview(diary: DiaryService = Depends(get_service)) -> PreviewResponse:
+    def preview(refresh: bool = False, diary: DiaryService = Depends(get_service)) -> PreviewResponse:
         try:
-            markdown = diary.preview()
+            markdown = diary.preview(refresh=refresh)
         except ValueError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except Exception as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
-        return PreviewResponse(day=diary.day, markdown=markdown)
+        return PreviewResponse(day=diary.day, markdown=markdown,
+                               **{key: value for key, value in diary.draft_status().items() if key != "exists"})
+
+    @app.put("/v1/preview", response_model=PreviewResponse)
+    def edit_preview(body: DraftEditRequest, diary: DiaryService = Depends(get_service)) -> PreviewResponse:
+        try:
+            markdown = diary.edit_draft(body.markdown)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return PreviewResponse(day=diary.day, markdown=markdown,
+                               **{key: value for key, value in diary.draft_status().items() if key != "exists"})
 
     @app.post("/v1/finalize", response_model=FinalizeResponse)
     def finalize(diary: DiaryService = Depends(get_service)) -> FinalizeResponse:
@@ -149,7 +189,7 @@ def create_app(service: DiaryService | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except Exception as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
-        return FinalizeResponse(day=diary.day, path=str(path))
+        return FinalizeResponse(day=diary.day, path=str(path), stale=diary.draft_status()["stale"])
 
     @app.get("/v1/memories", response_model=MemoryResponse)
     def memories(diary: DiaryService = Depends(get_service)) -> MemoryResponse:

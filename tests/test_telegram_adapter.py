@@ -93,7 +93,7 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
         message = self.received.call_args.args[0]
         self.assertEqual((message.channel, message.external_user_id, message.message_id,
                           message.text, message.kind),
-                         ("telegram", "101", "1001", "今天完成了工作 🙂", "text"))
+                         ("telegram", "101", "1001", "  今天完成了工作 🙂  ", "text"))
         self.assertEqual(message.timestamp, datetime.fromtimestamp(1700000000, timezone.utc))
 
     async def test_group_and_mismatched_private_identity_never_route(self):

@@ -160,14 +160,14 @@ class TelegramAdapter(ChannelAdapter):
         if raw_id is None:
             return None
         timestamp = datetime.fromtimestamp(message.get("date", 0), timezone.utc)
-        return IncomingMessage("telegram", str(sender), str(raw_id), text.strip(),
+        return IncomingMessage("telegram", str(sender), str(raw_id), text,
                                timestamp, kind="action" if callback else "text")
 
     def _is_batchable_update(self, update: dict) -> bool:
         message = self.normalize_update(update)
         return bool(self.message_debounce_seconds > 0 and message
                     and self.is_authorized(message.external_user_id)
-                    and message.kind == "text" and not message.text.startswith("/"))
+                    and message.kind == "text" and not message.text.lstrip().startswith("/"))
 
     async def handle_update(self, update: dict) -> None:
         message = self.normalize_update(update)
@@ -245,6 +245,22 @@ class TelegramAdapter(ChannelAdapter):
         restored = json.loads(self.state_store.get_state(self.state_key + ":inbox", "[]") or "[]")
         self._inbox = list(restored)
         await self._call_until_connected("deleteWebhook", drop_pending_updates=False)
+        await self._call_until_connected("setMyCommands", commands=[
+            {"command": command, "description": description}
+            for command, description in (
+                ("todo", "查看或管理 Todo"),
+                ("today", "今天需要做什么"),
+                ("week", "未来七天的 Todo"),
+                ("calendar", "回顾最近30天的活动和完成 Todo"),
+                ("preview", "预览今天的日记草稿"),
+                ("edit", "编辑日记草稿"),
+                ("quote", "将原话原封不动放进日记"),
+                ("done", "把日记写入 Obsidian"),
+                ("memory", "查看长期记忆"),
+                ("status", "查看 Bot 当前运行配置"),
+                ("help", "查看帮助"),
+            )
+        ])
         print(f"Telegram Bot @{me.get('username', '')} 已启动")
         if self.pairing_mode:
             print("当前为配对模式：给 Bot 发送 /start 获取你的 user ID")

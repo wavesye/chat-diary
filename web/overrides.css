@@ -90,6 +90,24 @@
 .review-tags { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 26px; }
 .review-tags span { padding: 5px 9px; border-radius: 999px; background: var(--cream); color: var(--muted); font-size: 12px; }
 
+.preview { width: min(760px, 95vw); }
+.draft-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.draft-tabs { display: flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 11px; }
+.draft-tabs button { border: 0; border-radius: 7px; padding: 7px 10px; background: transparent; color: var(--muted); font-size: 12px; }
+.draft-tabs button[aria-selected="true"] { background: var(--paper); color: var(--ink); box-shadow: 0 2px 5px rgba(67,54,38,.07); }
+.draft-status { margin: 12px 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.draft-status.stale { color: var(--warm); }
+.draft-editor { flex: 1; min-height: 0; max-height: none; resize: none; padding: 22px; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); font: 14px/1.8 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; tab-size: 2; }
+.draft-editor:focus { border-color: var(--sage); }
+.paper { min-height: 0; overflow-wrap: anywhere; }
+.paper > p:last-child { display: block; }
+.paper li { list-style: none; }
+.paper blockquote { white-space: pre-wrap; }
+.draft-actions { display: flex; gap: 10px; margin-top: 13px; }
+.draft-actions button { flex: 1; height: 44px; }
+button:disabled { cursor: default; opacity: .45; }
+.draft-editor:read-only { opacity: .7; }
+
 @media (max-width: 920px) {
   .review-layout { grid-template-columns: 1fr; }
   .day-review { position: static; min-height: 220px; }

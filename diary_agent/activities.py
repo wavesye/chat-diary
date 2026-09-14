@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from datetime import date
 from pathlib import Path
+
+
+def activity_title_key(title: str) -> str:
+    """Match activity titles despite cosmetic spacing, casing and punctuation."""
+    normalized = unicodedata.normalize("NFKC", str(title)).casefold()
+    return re.sub(r"\s+", "", normalized).strip(".,，。!！?？;；:：·-—–_")
 
 
 class ActivityService:
@@ -12,12 +19,15 @@ class ActivityService:
 
     def replace_chat_summary(self, day: str, items: list[dict]) -> int:
         cleaned = []
+        seen = set()
         for item in items if isinstance(items, list) else []:
             if not isinstance(item, dict):
                 continue
             title = str(item.get("title", "")).strip()
-            if not title:
+            title_key = activity_title_key(title)
+            if not title_key or title_key in seen:
                 continue
+            seen.add(title_key)
             try:
                 confidence = max(0.0, min(float(item.get("confidence", 0.8)), 1.0))
             except (TypeError, ValueError):
@@ -27,6 +37,13 @@ class ActivityService:
             cleaned.append((title, str(item.get("description", "")).strip(), tags, confidence))
         with self.store._lock, self.store.connection:
             # Natural-language completion records carry source_message_id and are preserved.
+            recorded = self.store.connection.execute(
+                "SELECT title FROM activities WHERE day=? AND "
+                "(source_type='todo' OR (source_type='chat' AND source_message_id IS NOT NULL))",
+                (day,),
+            ).fetchall()
+            recorded_titles = {activity_title_key(row["title"]) for row in recorded}
+            cleaned = [item for item in cleaned if activity_title_key(item[0]) not in recorded_titles]
             self.store.connection.execute(
                 "DELETE FROM activities WHERE day=? AND source_type='chat' "
                 "AND source_message_id IS NULL", (day,),
