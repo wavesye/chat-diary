@@ -174,7 +174,20 @@ class TelegramAdapter(ChannelAdapter):
         callback_id = update.get("callback_query", {}).get("id")
         if callback_id:
             # Clear the client spinner before potentially slow model or disk work.
-            await self.api.call("answerCallbackQuery", callback_query_id=callback_id)
+            try:
+                await self.api.call("answerCallbackQuery", callback_query_id=callback_id)
+            except TelegramAPIError as error:
+                description = str(error).lower()
+                expired = (
+                    "query is too old" in description or 
+                    "query id is invalid" in description
+                )
+                if error.error_code != 400 or not expired:
+                    raise
+                print("跳过失效按键点击, 请重新点击", file=sys.stderr)
+                return
+                
+
         if message is None:
             return
         if not self.is_authorized(message.external_user_id):
